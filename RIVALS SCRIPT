@@ -1,0 +1,1177 @@
+--[[
+    GUI X FREE
+    Panel de pruebas para TU juego en Roblox Studio.
+    RightShift = mostrar/ocultar | "–" = minimizar | "✕" = cerrar y apagar todo
+
+    OPCIONES:
+    • AIMBOT      -> apunta solo a la cabeza; cuerpo y manos siguen
+    • RAGEBOT     -> TP a la espalda del más cercano, mantiene click izquierdo (disparar)
+                     y click derecho (apuntar) hasta que muere; luego vuelve a tu posición
+    • TRIGGER BOT -> saca el arma con balas (arma 1, luego arma 2) y dispara al apuntar a alguien
+    • ESP         -> caja 2D + barra de vida
+    • FPS BOOST   -> baja efectos y calidad para subir FPS
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- ===== CONFIG =====
+local ALLOWED = {
+	[player.UserId] = true, -- cambia por tu UserId real si quieres restringirlo
+}
+if not ALLOWED[player.UserId] then return end
+
+local TOGGLE_KEY = Enum.KeyCode.RightShift
+local TRIGGER_RANGE = 300
+local TRIGGER_DEBUG = true      -- imprime en el Output por qué dispara o no dispara
+
+-- RageBot
+local BEHIND_DISTANCE = 2                   -- studs detrás de la espalda (más bajo = más pegado)
+local RAGE_NOCLIP = true                    -- sin colisión mientras persigues, para no salir despedido
+local RAGE_FIRE_MODE = "hold"               -- "hold" = click izquierdo mantenido | "click" = clicks cortos repetidos
+local RAGE_FIRE_INTERVAL = 0.05             -- segundos entre clicks (solo modo "click")
+local RAGE_AIM_RIGHT_CLICK = true           -- true = también mantiene el click derecho (apuntar)
+local RAGE_NEXT_DELAY = 0.6                 -- espera tras volver a tu posición antes del siguiente objetivo
+local RAGE_FIRE_ATTRIBUTE = "GUIXFREE_Fire" -- atributo del jugador: true = click izquierdo apretado
+local RAGE_AIM_ATTRIBUTE = "GUIXFREE_Aim"   -- atributo del jugador: true = click derecho apretado
+local RAGE_USE_VIM = true                   -- intenta apretar los clicks reales (puede estar bloqueado)
+
+-- Brazos / manos
+local ARMS_AIM = true        -- true = el aimbot también mueve brazos/manos hacia la cabeza
+local ARM_PITCH_MULT = 1     -- 1 = ángulo exacto. Sube/baja si las manos quedan cortas o pasadas
+local ARM_PITCH_OFFSET = 0   -- en radianes, para corregir un poco (ej: math.rad(-5))
+
+-- ===== CONFIG DE MUNICIÓN / ARMAS =====
+-- Si ya sabes el nombre EXACTO del valor de munición de tus armas, ponlo aquí (ej: "Ammo").
+-- Si lo dejas en nil, el script lo detecta solo y te dice en el Output cuál encontró.
+local AMMO_NAME = nil
+-- Orden de armas por nombre de Tool (opcional). Ej: { "Pistola", "Rifle" }
+local WEAPON_ORDER = {}
+local AMMO_KEYWORDS = { "ammo", "bullet", "clip", "muni", "bala", "cartuch", "magazine", "rounds" }
+local AMMO_EXCLUDE = { "max", "capacity", "maximum" }
+local AMMO_DEBUG = true -- imprime en el Output lo que encuentra de cada arma
+
+local THEME = {
+	bg = Color3.fromRGB(15, 15, 22),
+	header = Color3.fromRGB(24, 24, 36),
+	row = Color3.fromRGB(26, 26, 38),
+	accent = Color3.fromRGB(125, 85, 255),
+	accent2 = Color3.fromRGB(70, 160, 255),
+	on = Color3.fromRGB(60, 210, 130),
+	off = Color3.fromRGB(70, 70, 90),
+	text = Color3.fromRGB(240, 240, 250),
+	subtext = Color3.fromRGB(140, 140, 165),
+}
+
+-- ===== ESTADO =====
+local state = { Aimbot = false, RageBot = false, TriggerBot = false, ESP = false, FPSBoost = false }
+
+local connections = {}
+local function connect(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(connections, c)
+	return c
+end
+
+-- ===== UTILIDADES =====
+local function getChar(p)
+	local c = p.Character
+	if not c then return end
+	local hum = c:FindFirstChildOfClass("Humanoid")
+	local root = c:FindFirstChild("HumanoidRootPart")
+	local head = c:FindFirstChild("Head")
+	if hum and root and head and hum.Health > 0 then
+		return c, hum, root, head
+	end
+end
+
+local function getNearestPlayer()
+	local myChar, _, myRoot = getChar(player)
+	if not myChar then return end
+	local best, bestDist
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player then
+			local c, _, root = getChar(p)
+			if c then
+				local d = (root.Position - myRoot.Position).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = p, d
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function corner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = parent
+	return c
+end
+
+local function tween(obj, props, t)
+	TweenService:Create(obj, TweenInfo.new(t or 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+-- ===== RAGEBOT: CLICKS MANTENIDOS =====
+local rageTarget = nil
+local rageOrigin = nil
+local rageCooldownUntil = 0
+local rageStop = nil
+local heldTool = nil
+
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+local vimWorks = nil
+local mouseHeld = false   -- click izquierdo (disparar)
+local aimHeld = false     -- click derecho (apuntar)
+
+-- Manda un click real (button: 0 = izquierdo, 1 = derecho). Devuelve true si funcionó.
+local function vimButton(button, down)
+	if not (RAGE_USE_VIM and VIM) or vimWorks == false then return false end
+	local c = camera.ViewportSize / 2
+	local ok = pcall(function()
+		VIM:SendMouseButtonEvent(c.X, c.Y, button, down, game, 0)
+	end)
+	if ok then
+		if vimWorks == nil then
+			vimWorks = true
+			print("[GUI X FREE][RageBot] clicks reales (VirtualInputManager): OK")
+		end
+	else
+		vimWorks = false
+		print("[GUI X FREE][RageBot] VirtualInputManager bloqueado. Uso Tool:Activate() y los atributos "
+			.. RAGE_FIRE_ATTRIBUTE .. " / " .. RAGE_AIM_ATTRIBUTE .. ".")
+	end
+	return ok
+end
+
+-- Click IZQUIERDO mantenido (disparar)
+local function holdFire(on)
+	player:SetAttribute(RAGE_FIRE_ATTRIBUTE, on)
+	if on ~= mouseHeld then
+		vimButton(0, on)
+	end
+	mouseHeld = on
+
+	if not on then
+		if heldTool then
+			pcall(function() heldTool:Deactivate() end)
+			heldTool = nil
+		end
+		local ch = player.Character
+		local t = ch and ch:FindFirstChildOfClass("Tool")
+		if t then pcall(function() t:Deactivate() end) end
+	end
+end
+
+-- Click DERECHO mantenido (apuntar)
+local function holdAim(on)
+	player:SetAttribute(RAGE_AIM_ATTRIBUTE, on)
+	if on ~= aimHeld then
+		vimButton(1, on)
+	end
+	aimHeld = on
+end
+
+-- ===== FPS BOOST =====
+local fpsParts = setmetatable({}, { __mode = "k" })
+local fpsEffects = setmetatable({}, { __mode = "k" })
+local fpsLighting = nil
+local fpsWater = nil
+local fpsQuality = nil
+local fpsAddedConn = nil
+local fpsToken = 0
+
+local EFFECT_CLASSES = { "ParticleEmitter", "Trail", "Beam", "Smoke", "Fire", "Sparkles", "PostEffect" }
+
+local function isEffect(inst)
+	for _, cls in ipairs(EFFECT_CLASSES) do
+		if inst:IsA(cls) then return true end
+	end
+	return false
+end
+
+local function boostInstance(inst)
+	if inst:IsA("BasePart") and not inst:IsA("Terrain") then
+		if not fpsParts[inst] then
+			fpsParts[inst] = { inst.Material, inst.Reflectance, inst.CastShadow }
+		end
+		inst.Material = Enum.Material.SmoothPlastic
+		inst.Reflectance = 0
+		inst.CastShadow = false
+	elseif isEffect(inst) then
+		if fpsEffects[inst] == nil then
+			fpsEffects[inst] = inst.Enabled
+		end
+		inst.Enabled = false
+	end
+end
+
+local function setFPSBoost(enabled)
+	fpsToken += 1
+	local myToken = fpsToken
+
+	if enabled then
+		if not fpsLighting then
+			fpsLighting = { GlobalShadows = Lighting.GlobalShadows }
+		end
+		Lighting.GlobalShadows = false
+
+		local terrain = workspace:FindFirstChildOfClass("Terrain")
+		if terrain and not fpsWater then
+			fpsWater = {
+				WaterWaveSize = terrain.WaterWaveSize,
+				WaterWaveSpeed = terrain.WaterWaveSpeed,
+				WaterReflectance = terrain.WaterReflectance,
+			}
+		end
+		if terrain then
+			pcall(function()
+				terrain.WaterWaveSize = 0
+				terrain.WaterWaveSpeed = 0
+				terrain.WaterReflectance = 0
+			end)
+		end
+
+		pcall(function()
+			local rendering = settings().Rendering
+			if fpsQuality == nil then fpsQuality = rendering.QualityLevel end
+			rendering.QualityLevel = Enum.QualityLevel.Level01
+		end)
+
+		for _, inst in ipairs(Lighting:GetDescendants()) do
+			if isEffect(inst) then boostInstance(inst) end
+		end
+
+		task.spawn(function()
+			local count = 0
+			for _, inst in ipairs(workspace:GetDescendants()) do
+				if myToken ~= fpsToken then return end
+				boostInstance(inst)
+				count += 1
+				if count % 400 == 0 then task.wait() end
+			end
+		end)
+
+		if fpsAddedConn then fpsAddedConn:Disconnect() end
+		fpsAddedConn = workspace.DescendantAdded:Connect(function(inst)
+			if state.FPSBoost then boostInstance(inst) end
+		end)
+	else
+		if fpsAddedConn then
+			fpsAddedConn:Disconnect()
+			fpsAddedConn = nil
+		end
+
+		if fpsLighting then
+			Lighting.GlobalShadows = fpsLighting.GlobalShadows
+			fpsLighting = nil
+		end
+
+		local terrain = workspace:FindFirstChildOfClass("Terrain")
+		if terrain and fpsWater then
+			pcall(function()
+				terrain.WaterWaveSize = fpsWater.WaterWaveSize
+				terrain.WaterWaveSpeed = fpsWater.WaterWaveSpeed
+				terrain.WaterReflectance = fpsWater.WaterReflectance
+			end)
+		end
+		fpsWater = nil
+
+		if fpsQuality ~= nil then
+			pcall(function() settings().Rendering.QualityLevel = fpsQuality end)
+			fpsQuality = nil
+		end
+
+		task.spawn(function()
+			local count = 0
+			for inst, data in pairs(fpsParts) do
+				if myToken ~= fpsToken then return end
+				if inst.Parent then
+					inst.Material = data[1]
+					inst.Reflectance = data[2]
+					inst.CastShadow = data[3]
+				end
+				fpsParts[inst] = nil
+				count += 1
+				if count % 400 == 0 then task.wait() end
+			end
+			for inst, was in pairs(fpsEffects) do
+				if myToken ~= fpsToken then return end
+				if inst.Parent then inst.Enabled = was end
+				fpsEffects[inst] = nil
+			end
+		end)
+	end
+end
+
+-- ===== MUNICIÓN / ARMAS =====
+local function matchesAmmo(name)
+	local l = string.lower(name)
+	for _, ex in ipairs(AMMO_EXCLUDE) do
+		if l:find(ex, 1, true) then return false end
+	end
+	if l == "mag" or l == "mags" then return true end
+	for _, k in ipairs(AMMO_KEYWORDS) do
+		if l:find(k, 1, true) then return true end
+	end
+	return false
+end
+
+-- Devuelve (cantidad, nombreDondeLaEncontró) o nil si no la encuentra
+local function getAmmo(tool)
+	if AMMO_NAME then
+		local a = tool:GetAttribute(AMMO_NAME)
+		if typeof(a) == "number" then return a, AMMO_NAME end
+		local v = tool:FindFirstChild(AMMO_NAME, true)
+		if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then return v.Value, AMMO_NAME end
+		local ownerChar = tool.Parent
+		if ownerChar then
+			local pv = ownerChar:FindFirstChild(AMMO_NAME, true)
+			if pv and (pv:IsA("NumberValue") or pv:IsA("IntValue")) then return pv.Value, AMMO_NAME end
+		end
+		return nil
+	end
+
+	for name, val in pairs(tool:GetAttributes()) do
+		if typeof(val) == "number" and matchesAmmo(name) then
+			return val, name
+		end
+	end
+
+	for _, d in ipairs(tool:GetDescendants()) do
+		if (d:IsA("NumberValue") or d:IsA("IntValue")) and matchesAmmo(d.Name) then
+			return d.Value, d.Name
+		end
+		for name, val in pairs(d:GetAttributes()) do
+			if typeof(val) == "number" and matchesAmmo(name) then
+				return val, d.Name .. "." .. name
+			end
+		end
+	end
+
+	return nil
+end
+
+local debugged = setmetatable({}, { __mode = "k" })
+local function debugTool(tool)
+	if not AMMO_DEBUG or debugged[tool] then return end
+	debugged[tool] = true
+
+	local ammo, where = getAmmo(tool)
+	if ammo ~= nil then
+		print(("[GUI X FREE] Arma '%s': munición detectada en '%s' = %s"):format(tool.Name, where, tostring(ammo)))
+		return
+	end
+
+	local lines = {}
+	for name, val in pairs(tool:GetAttributes()) do
+		table.insert(lines, ("  atributo %s = %s"):format(name, tostring(val)))
+	end
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("NumberValue") or d:IsA("IntValue") or d:IsA("StringValue") then
+			table.insert(lines, ("  valor %s (%s) = %s"):format(d:GetFullName(), d.ClassName, tostring(d.Value)))
+		end
+	end
+	warn(("[GUI X FREE] No encontré munición en '%s'. Esto es lo que tiene:\n%s\n"
+		.. "Dime cuál es la de balas, o ponla en AMMO_NAME."):format(
+		tool.Name, #lines > 0 and table.concat(lines, "\n") or "  (sin atributos ni valores)"))
+end
+
+local toolOrder = setmetatable({}, { __mode = "k" })
+local nextOrder = 0
+
+local function getTools(char)
+	local list = {}
+	for _, t in ipairs(player.Backpack:GetChildren()) do
+		if t:IsA("Tool") then table.insert(list, t) end
+	end
+	local eq = char:FindFirstChildOfClass("Tool")
+	if eq then table.insert(list, eq) end
+
+	for _, t in ipairs(list) do
+		if not toolOrder[t] then
+			nextOrder += 1
+			toolOrder[t] = nextOrder
+		end
+	end
+
+	local function rank(t)
+		for i, n in ipairs(WEAPON_ORDER) do
+			if t.Name == n then return i end
+		end
+		return #WEAPON_ORDER + 1
+	end
+
+	table.sort(list, function(a, b)
+		local ra, rb = rank(a), rank(b)
+		if ra ~= rb then return ra < rb end
+		return toolOrder[a] < toolOrder[b]
+	end)
+	return list
+end
+
+-- Primera arma con balas. Si ninguna tiene (o no se detecta la munición),
+-- usa la que tengas en la mano o, si no, la primera del inventario.
+local function pickWeapon(char)
+	local tools = getTools(char)
+	for _, t in ipairs(tools) do
+		debugTool(t)
+		local ammo = getAmmo(t)
+		if ammo == nil or ammo > 0 then
+			return t
+		end
+	end
+	return char:FindFirstChildOfClass("Tool") or tools[1]
+end
+
+-- ===== GUI =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "GUI_X_FREE"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local HEADER_H = 46
+local BODY_H = 300
+local FULL_H = HEADER_H + BODY_H
+
+local frame = Instance.new("Frame")
+frame.Name = "Main"
+frame.Size = UDim2.fromOffset(270, FULL_H)
+frame.Position = UDim2.new(0, 30, 0.5, -FULL_H / 2)
+frame.BackgroundColor3 = THEME.bg
+frame.BorderSizePixel = 0
+frame.ClipsDescendants = true
+frame.Parent = gui
+corner(frame, 12)
+
+local frameStroke = Instance.new("UIStroke")
+frameStroke.Thickness = 1.5
+frameStroke.Color = Color3.new(1, 1, 1)
+frameStroke.Parent = frame
+local strokeGrad = Instance.new("UIGradient")
+strokeGrad.Color = ColorSequence.new(THEME.accent, THEME.accent2)
+strokeGrad.Rotation = 45
+strokeGrad.Parent = frameStroke
+
+-- Cabecera
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, HEADER_H)
+header.BackgroundColor3 = THEME.header
+header.BorderSizePixel = 0
+header.Parent = frame
+
+local headerGrad = Instance.new("UIGradient")
+headerGrad.Color = ColorSequence.new(Color3.fromRGB(34, 28, 62), Color3.fromRGB(20, 24, 40))
+headerGrad.Rotation = 0
+headerGrad.Parent = header
+
+local dot = Instance.new("Frame")
+dot.Size = UDim2.fromOffset(8, 8)
+dot.Position = UDim2.new(0, 14, 0.5, -4)
+dot.BackgroundColor3 = THEME.accent
+dot.BorderSizePixel = 0
+dot.Parent = header
+corner(dot, 4)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -100, 1, 0)
+title.Position = UDim2.fromOffset(30, 0)
+title.BackgroundTransparency = 1
+title.Text = "GUI X FREE"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBlack
+title.TextSize = 18
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
+local titleGrad = Instance.new("UIGradient")
+titleGrad.Color = ColorSequence.new(THEME.accent, THEME.accent2)
+titleGrad.Parent = title
+
+local function headerButton(text, xOffset, hoverColor)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(28, 28)
+	b.Position = UDim2.new(1, xOffset, 0.5, -14)
+	b.BackgroundColor3 = Color3.fromRGB(40, 40, 58)
+	b.Text = text
+	b.TextColor3 = THEME.text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 16
+	b.AutoButtonColor = false
+	b.Parent = header
+	corner(b, 8)
+	connect(b.MouseEnter, function() tween(b, { BackgroundColor3 = hoverColor }, 0.15) end)
+	connect(b.MouseLeave, function() tween(b, { BackgroundColor3 = Color3.fromRGB(40, 40, 58) }, 0.15) end)
+	return b
+end
+
+local minBtn = headerButton("–", -70, Color3.fromRGB(70, 90, 160))
+local closeBtn = headerButton("✕", -38, Color3.fromRGB(200, 55, 70))
+
+-- Arrastrar desde la cabecera
+do
+	local dragging, dragStart, startPos
+	connect(header.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+		end
+	end)
+	connect(UserInputService.InputChanged, function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+	connect(UserInputService.InputEnded, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+-- Cuerpo
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 0, BODY_H)
+body.Position = UDim2.fromOffset(0, HEADER_H)
+body.BackgroundTransparency = 1
+body.Parent = frame
+
+local bodyPad = Instance.new("UIPadding")
+bodyPad.PaddingTop = UDim.new(0, 12)
+bodyPad.PaddingLeft = UDim.new(0, 12)
+bodyPad.PaddingRight = UDim.new(0, 12)
+bodyPad.Parent = body
+
+local bodyLayout = Instance.new("UIListLayout")
+bodyLayout.Padding = UDim.new(0, 8)
+bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+bodyLayout.Parent = body
+
+local function makeToggle(name, label, subtitle, order, onChange)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 46)
+	row.BackgroundColor3 = THEME.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = body
+	corner(row, 10)
+
+	local rowStroke = Instance.new("UIStroke")
+	rowStroke.Color = Color3.fromRGB(45, 45, 65)
+	rowStroke.Thickness = 1
+	rowStroke.Parent = row
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, -70, 0, 20)
+	lbl.Position = UDim2.fromOffset(12, 6)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = label
+	lbl.TextColor3 = THEME.text
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextSize = 14
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Parent = row
+
+	local sub = Instance.new("TextLabel")
+	sub.Size = UDim2.new(1, -70, 0, 14)
+	sub.Position = UDim2.fromOffset(12, 25)
+	sub.BackgroundTransparency = 1
+	sub.Text = subtitle
+	sub.TextColor3 = THEME.subtext
+	sub.Font = Enum.Font.Gotham
+	sub.TextSize = 11
+	sub.TextXAlignment = Enum.TextXAlignment.Left
+	sub.Parent = row
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.fromOffset(44, 22)
+	track.Position = UDim2.new(1, -56, 0.5, -11)
+	track.BackgroundColor3 = THEME.off
+	track.BorderSizePixel = 0
+	track.Parent = row
+	corner(track, 11)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.Position = UDim2.fromOffset(3, 3)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+	corner(knob, 8)
+
+	local click = Instance.new("TextButton")
+	click.Size = UDim2.fromScale(1, 1)
+	click.BackgroundTransparency = 1
+	click.Text = ""
+	click.Parent = row
+
+	local function refresh()
+		local on = state[name]
+		tween(track, { BackgroundColor3 = on and THEME.on or THEME.off })
+		tween(knob, { Position = on and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3) })
+		tween(rowStroke, { Color = on and THEME.on or Color3.fromRGB(45, 45, 65) })
+	end
+
+	connect(click.MouseButton1Click, function()
+		state[name] = not state[name]
+		refresh()
+		if onChange then onChange(state[name]) end
+	end)
+	connect(click.MouseEnter, function() tween(row, { BackgroundColor3 = Color3.fromRGB(32, 32, 48) }, 0.15) end)
+	connect(click.MouseLeave, function() tween(row, { BackgroundColor3 = THEME.row }, 0.15) end)
+end
+
+makeToggle("Aimbot", "AIMBOT", "Cabeza + manos siguen", 1)
+makeToggle("RageBot", "RAGEBOT", "TP, click izq + der, mata", 2, function(on)
+	-- Al apagarlo: soltar los clicks y volver a tu posición original
+	if not on and rageStop then rageStop(true) end
+end)
+makeToggle("TriggerBot", "TRIGGER BOT", "Saca arma 1, luego arma 2", 3)
+makeToggle("ESP", "ESP", "Caja 2D + barra de vida", 4)
+makeToggle("FPSBoost", "FPS BOOST", "Menos efectos, más FPS", 5, setFPSBoost)
+
+local footer = Instance.new("TextLabel")
+footer.Size = UDim2.new(1, 0, 0, 16)
+footer.BackgroundTransparency = 1
+footer.Text = "RightShift: ocultar / mostrar"
+footer.TextColor3 = THEME.subtext
+footer.Font = Enum.Font.Gotham
+footer.TextSize = 11
+footer.LayoutOrder = 6
+footer.Parent = body
+
+-- Minimizar
+local minimized = false
+connect(minBtn.MouseButton1Click, function()
+	minimized = not minimized
+	minBtn.Text = minimized and "+" or "–"
+	if minimized then
+		body.Visible = false
+		tween(frame, { Size = UDim2.fromOffset(270, HEADER_H) }, 0.25)
+	else
+		tween(frame, { Size = UDim2.fromOffset(270, FULL_H) }, 0.25)
+		task.delay(0.1, function()
+			if not minimized then body.Visible = true end
+		end)
+	end
+end)
+
+-- Mostrar / ocultar con tecla
+connect(UserInputService.InputBegan, function(input, gpe)
+	if gpe then return end
+	if input.KeyCode == TOGGLE_KEY then
+		frame.Visible = not frame.Visible
+	end
+end)
+
+-- ===== RAGEBOT: PEGARSE A LA ESPALDA =====
+-- Se ejecuta en cada frame y otra vez tras la física, con la velocidad en 0
+-- para que nada te empuje fuera de su espalda.
+local function stickBehind()
+	if not state.RageBot or not rageTarget then return end
+	local _, _, myRoot = getChar(player)
+	local _, _, tRoot = getChar(rageTarget)
+	if not myRoot or not tRoot then return end
+
+	-- "Detrás" según hacia dónde mira el enemigo, a su misma altura
+	local look = Vector3.new(tRoot.CFrame.LookVector.X, 0, tRoot.CFrame.LookVector.Z)
+	if look.Magnitude < 0.01 then look = Vector3.new(0, 0, -1) end
+	look = look.Unit
+
+	local pos = tRoot.Position - look * BEHIND_DISTANCE
+	local lookAt = Vector3.new(tRoot.Position.X, pos.Y, tRoot.Position.Z)
+
+	myRoot.CFrame = CFrame.lookAt(pos, lookAt)
+	myRoot.AssemblyLinearVelocity = Vector3.zero
+	myRoot.AssemblyAngularVelocity = Vector3.zero
+end
+
+RunService:BindToRenderStep("GUIXFREE_RageStick", Enum.RenderPriority.Character.Value + 1, stickBehind)
+
+-- Sin colisión mientras persigues (para no ser empujado)
+connect(RunService.Stepped, function()
+	if not (RAGE_NOCLIP and state.RageBot and rageTarget) then return end
+	local ch = player.Character
+	if not ch then return end
+	for _, p in ipairs(ch:GetDescendants()) do
+		if p:IsA("BasePart") then p.CanCollide = false end
+	end
+end)
+
+-- ===== AIMBOT / RAGEBOT: CÁMARA + CUERPO =====
+-- Prioridades: personaje (+1) → cámara (200) → aimbot (+1) → tus manos (+2) → brazos del aimbot (+3)
+local AIM_PRIORITY = Enum.RenderPriority.Camera.Value + 1
+local ARMS_PRIORITY = Enum.RenderPriority.Camera.Value + 3
+local autoRotateBackup = nil
+local aimTargetHead = nil
+
+RunService:BindToRenderStep("GUIXFREE_Aimbot", AIM_PRIORITY, function()
+	local myChar, myHum, myRoot = getChar(player)
+	local active = state.Aimbot or state.RageBot
+
+	if not active then
+		aimTargetHead = nil
+		if autoRotateBackup ~= nil and myHum then
+			myHum.AutoRotate = autoRotateBackup
+			autoRotateBackup = nil
+		end
+		return
+	end
+	if not myChar then aimTargetHead = nil return end
+
+	-- El RageBot apunta a su objetivo fijo; el Aimbot normal al más cercano
+	local target
+	if state.RageBot then
+		target = rageTarget
+	else
+		target = getNearestPlayer()
+	end
+	if not target then aimTargetHead = nil return end
+
+	local _, _, _, tHead = getChar(target)
+	if not tHead then aimTargetHead = nil return end
+
+	if autoRotateBackup == nil then
+		autoRotateBackup = myHum.AutoRotate
+	end
+	myHum.AutoRotate = false
+
+	-- La cámara apunta solo a la cabeza
+	camera.CFrame = CFrame.lookAt(camera.CFrame.Position, tHead.Position)
+
+	-- El cuerpo gira hacia el objetivo (horizontal)
+	local flat = Vector3.new(tHead.Position.X, myRoot.Position.Y, tHead.Position.Z)
+	myRoot.CFrame = CFrame.lookAt(myRoot.Position, flat)
+
+	aimTargetHead = tHead
+end)
+
+-- ===== BRAZOS / MANOS APUNTAN A LA CABEZA =====
+local armState = {}
+
+local function findShoulders(char)
+	local list = {}
+	local rUA = char:FindFirstChild("RightUpperArm")
+	local lUA = char:FindFirstChild("LeftUpperArm")
+	if rUA and lUA then -- R15
+		local r = rUA:FindFirstChild("RightShoulder")
+		local l = lUA:FindFirstChild("LeftShoulder")
+		if r then table.insert(list, { joint = r, r6 = false, sign = 1 }) end
+		if l then table.insert(list, { joint = l, r6 = false, sign = 1 }) end
+	else -- R6
+		local torso = char:FindFirstChild("Torso")
+		if torso then
+			local r = torso:FindFirstChild("Right Shoulder")
+			local l = torso:FindFirstChild("Left Shoulder")
+			if r then table.insert(list, { joint = r, r6 = true, sign = 1 }) end
+			if l then table.insert(list, { joint = l, r6 = true, sign = -1 }) end
+		end
+	end
+	return list
+end
+
+local function applyArmPitch(char, pitch)
+	for _, info in ipairs(findShoulders(char)) do
+		local j = info.joint
+		local st = armState[j]
+		if not st then
+			st = {}
+			armState[j] = st
+		end
+		if st.last == nil or j.C0 ~= st.last then
+			st.orig = j.C0
+		end
+		local rot
+		if info.r6 then
+			rot = CFrame.Angles(0, 0, pitch * info.sign)
+		else
+			rot = CFrame.Angles(pitch, 0, 0)
+		end
+		local new = st.orig * rot
+		j.C0 = new
+		st.last = new
+	end
+end
+
+local function restoreArms()
+	for j, st in pairs(armState) do
+		if j.Parent and st.orig and st.last and j.C0 == st.last then
+			j.C0 = st.orig
+		end
+		armState[j] = nil
+	end
+end
+
+RunService:BindToRenderStep("GUIXFREE_AimArms", ARMS_PRIORITY, function()
+	local active = state.Aimbot or state.RageBot
+	if not ARMS_AIM or not active or not aimTargetHead then
+		if next(armState) ~= nil then restoreArms() end
+		return
+	end
+	local myChar = getChar(player)
+	if not myChar then return end
+
+	local dir = (aimTargetHead.Position - camera.CFrame.Position)
+	if dir.Magnitude < 0.01 then return end
+	dir = dir.Unit
+	local pitch = math.asin(math.clamp(dir.Y, -1, 1)) * ARM_PITCH_MULT + ARM_PITCH_OFFSET
+
+	applyArmPitch(myChar, pitch)
+end)
+
+-- ===== RAGEBOT =====
+-- 1) Guarda tu posición y se pega a la espalda del enemigo más cercano
+-- 2) Saca el arma con balas y deja apretado el click IZQUIERDO (disparar)
+--    y el click DERECHO (apuntar)
+-- 3) Cuando el enemigo muere: suelta ambos clicks y vuelve a tu posición original
+-- 4) Espera RAGE_NEXT_DELAY y pasa al siguiente
+rageStop = function(goHome)
+	holdFire(false)
+	holdAim(false)
+	local _, _, myRoot = getChar(player)
+	if goHome and rageOrigin and myRoot then
+		myRoot.CFrame = rageOrigin
+		myRoot.AssemblyLinearVelocity = Vector3.zero
+		myRoot.AssemblyAngularVelocity = Vector3.zero
+	end
+	rageOrigin = nil
+	rageTarget = nil
+	rageCooldownUntil = os.clock() + RAGE_NEXT_DELAY
+end
+
+local lastRageActivate = 0
+local lastRageEquip = 0
+local fireDebugged = setmetatable({}, { __mode = "k" })
+
+local function debugFire(tool)
+	if fireDebugged[tool] then return end
+	fireDebugged[tool] = true
+
+	local names = {}
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("LocalScript") or d:IsA("Script") or d:IsA("RemoteEvent")
+			or d:IsA("RemoteFunction") or d:IsA("BindableEvent") then
+			table.insert(names, d.ClassName .. ": " .. d.Name)
+		end
+	end
+	print(("[GUI X FREE][RageBot] disparando con '%s' (modo '%s'). Contiene: %s"):format(
+		tool.Name, RAGE_FIRE_MODE, #names > 0 and table.concat(names, ", ") or "nada"))
+
+	if not tool.Enabled then
+		warn("[GUI X FREE][RageBot] '" .. tool.Name .. "' tiene Enabled = false: Activate() no hará nada.")
+	end
+	if tool.ManualActivationOnly then
+		warn("[GUI X FREE][RageBot] '" .. tool.Name .. "' tiene ManualActivationOnly = true: Activate() no hará nada.")
+	end
+end
+
+connect(RunService.Heartbeat, function()
+	if not state.RageBot then return end
+
+	local myChar, myHum, myRoot = getChar(player)
+	if not myChar then
+		-- Si tú moriste, cancelar todo (no hay a dónde volver)
+		if rageTarget or mouseHeld or aimHeld then
+			rageOrigin = nil
+			rageStop(false)
+		end
+		return
+	end
+
+	if os.clock() < rageCooldownUntil then return end
+
+	-- ¿Murió el objetivo? → soltar ambos clicks y volver a tu sitio
+	if rageTarget and not (rageTarget.Parent and getChar(rageTarget)) then
+		print("[GUI X FREE][RageBot] objetivo eliminado → suelto clicks y vuelvo a mi posición")
+		rageStop(true)
+		return
+	end
+
+	-- Elegir objetivo nuevo y recordar de dónde sales
+	if not rageTarget then
+		rageTarget = getNearestPlayer()
+		if not rageTarget then return end
+		rageOrigin = myRoot.CFrame
+		print("[GUI X FREE][RageBot] objetivo: " .. rageTarget.Name)
+	end
+
+	-- Pegarse a la espalda (otra vez, después de la física)
+	stickBehind()
+
+	-- Sacar el arma (arma 1 → arma 2 si se queda sin balas)
+	local tool = pickWeapon(myChar)
+	if not tool then return end
+
+	-- Cambiando de arma: soltar clicks y volver a apretarlos con la nueva
+	if tool.Parent ~= myChar then
+		if mouseHeld then holdFire(false) end
+		if aimHeld then holdAim(false) end
+		if os.clock() - lastRageEquip > 0.05 then
+			lastRageEquip = os.clock()
+			myHum:EquipTool(tool)
+		end
+		return
+	end
+
+	debugFire(tool)
+
+	-- Click DERECHO apretado (apuntar) y luego click IZQUIERDO apretado (disparar)
+	if RAGE_AIM_RIGHT_CLICK and not aimHeld then
+		holdAim(true)
+	end
+	if not mouseHeld then
+		holdFire(true)
+	end
+
+	-- Refuerzo con Tool:Activate() para armas que usan Tool.Activated
+	if RAGE_FIRE_MODE == "hold" then
+		if heldTool ~= tool then
+			if heldTool then pcall(function() heldTool:Deactivate() end) end
+			pcall(function() tool:Activate() end)
+			heldTool = tool
+		end
+	else
+		if os.clock() - lastRageActivate >= RAGE_FIRE_INTERVAL then
+			lastRageActivate = os.clock()
+			pcall(function() tool:Activate() end)
+			task.defer(function()
+				if tool.Parent then pcall(function() tool:Deactivate() end) end
+			end)
+		end
+	end
+end)
+
+-- ===== TRIGGER BOT =====
+-- • Detecta si apuntas a un jugador (ignora tu cámara, manos y arma)
+-- • Saca el arma con balas (arma 1 → arma 2) y dispara
+-- • Si falla, dice por qué en el Output
+local lastSwitch = 0
+local lastDbgMsg, lastDbgTime = "", 0
+
+local function dbg(msg)
+	if not TRIGGER_DEBUG then return end
+	if msg ~= lastDbgMsg or os.clock() - lastDbgTime > 3 then
+		lastDbgMsg = msg
+		lastDbgTime = os.clock()
+		print("[GUI X FREE][TriggerBot] " .. msg)
+	end
+end
+
+local function getAimedPlayer(myChar)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { myChar, camera }
+	params.IgnoreWater = true
+
+	local pos
+	if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+		pos = camera.ViewportSize / 2
+	else
+		pos = UserInputService:GetMouseLocation()
+	end
+
+	local ray = camera:ViewportPointToRay(pos.X, pos.Y)
+	local result = workspace:Raycast(ray.Origin, ray.Direction * TRIGGER_RANGE, params)
+	if not result then
+		return nil, "el rayo no golpea nada"
+	end
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player and p.Character and result.Instance:IsDescendantOf(p.Character) then
+			return p
+		end
+	end
+	return nil, "apuntas a '" .. result.Instance:GetFullName() .. "' (no es un jugador)"
+end
+
+connect(RunService.Heartbeat, function()
+	if not state.TriggerBot then return end
+	local myChar, myHum = getChar(player)
+	if not myChar then
+		dbg("tu personaje no está vivo")
+		return
+	end
+
+	-- 1) Cambio automático al quedarse sin balas
+	local equipped = myChar:FindFirstChildOfClass("Tool")
+	if equipped then
+		debugTool(equipped)
+		local ammo = getAmmo(equipped)
+		if ammo ~= nil and ammo <= 0 and os.clock() - lastSwitch > 0.15 then
+			local nextTool = pickWeapon(myChar)
+			if nextTool and nextTool ~= equipped then
+				lastSwitch = os.clock()
+				dbg("sin balas en '" .. equipped.Name .. "', cambio a '" .. nextTool.Name .. "'")
+				myHum:EquipTool(nextTool)
+			end
+		end
+	end
+
+	-- 2) ¿Estoy apuntando a un jugador vivo?
+	local target, why = getAimedPlayer(myChar)
+	if not target then
+		dbg("sin objetivo: " .. tostring(why))
+		return
+	end
+	if not getChar(target) then
+		dbg(target.Name .. " ya está muerto")
+		return
+	end
+
+	-- 3) Sacar el arma correcta y disparar
+	local tool = pickWeapon(myChar)
+	if not tool then
+		dbg("no encontré ninguna Tool en tu Backpack ni en la mano (¿tu arma es una Tool?)")
+		return
+	end
+
+	if tool.Parent ~= myChar then
+		if os.clock() - lastSwitch > 0.05 then
+			lastSwitch = os.clock()
+			dbg("sacando '" .. tool.Name .. "'")
+			myHum:EquipTool(tool)
+		end
+		return
+	end
+
+	dbg("disparando a " .. target.Name .. " con '" .. tool.Name .. "'")
+	tool:Activate()
+end)
+
+-- ===== ESP (caja 2D + barra de vida) =====
+local espFolder = Instance.new("Folder")
+espFolder.Name = "ESP"
+espFolder.Parent = gui
+
+local espObjects = {}
+
+local function createESP(p)
+	local box = Instance.new("Frame")
+	box.BackgroundTransparency = 1
+	box.BorderSizePixel = 0
+	box.Visible = false
+	box.Parent = espFolder
+	local boxStroke = Instance.new("UIStroke")
+	boxStroke.Color = Color3.fromRGB(255, 255, 255)
+	boxStroke.Thickness = 1.5
+	boxStroke.Parent = box
+
+	local barBg = Instance.new("Frame")
+	barBg.BackgroundColor3 = Color3.new(0, 0, 0)
+	barBg.BorderSizePixel = 0
+	barBg.Visible = false
+	barBg.Parent = espFolder
+
+	local bar = Instance.new("Frame")
+	bar.BorderSizePixel = 0
+	bar.AnchorPoint = Vector2.new(0, 1)
+	bar.Parent = barBg
+
+	local hpText = Instance.new("TextLabel")
+	hpText.BackgroundTransparency = 1
+	hpText.TextColor3 = Color3.new(1, 1, 1)
+	hpText.TextStrokeTransparency = 0
+	hpText.Font = Enum.Font.GothamBold
+	hpText.TextSize = 12
+	hpText.Visible = false
+	hpText.Parent = espFolder
+
+	espObjects[p] = { box = box, barBg = barBg, bar = bar, hpText = hpText }
+end
+
+local function removeESP(p)
+	local o = espObjects[p]
+	if o then
+		o.box:Destroy()
+		o.barBg:Destroy()
+		o.hpText:Destroy()
+		espObjects[p] = nil
+	end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+	if p ~= player then createESP(p) end
+end
+connect(Players.PlayerAdded, function(p)
+	if p ~= player then createESP(p) end
+end)
+connect(Players.PlayerRemoving, removeESP)
+
+connect(RunService.RenderStepped, function()
+	for p, o in pairs(espObjects) do
+		local visible = false
+		if state.ESP then
+			local c, hum, root = getChar(p)
+			if c then
+				local topPos, onTop = camera:WorldToViewportPoint(root.Position + Vector3.new(0, 3, 0))
+				local botPos = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3.5, 0))
+				if onTop and topPos.Z > 0 then
+					visible = true
+					local h = math.abs(botPos.Y - topPos.Y)
+					local w = h / 1.8
+					local cx = topPos.X
+					local top = topPos.Y
+
+					o.box.Size = UDim2.fromOffset(w, h)
+					o.box.Position = UDim2.fromOffset(cx - w / 2, top)
+
+					local hpPct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+					o.barBg.Size = UDim2.fromOffset(4, h)
+					o.barBg.Position = UDim2.fromOffset(cx - w / 2 - 7, top)
+					o.bar.Size = UDim2.new(1, 0, hpPct, 0)
+					o.bar.Position = UDim2.new(0, 0, 1, 0)
+					o.bar.BackgroundColor3 = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), hpPct)
+
+					o.hpText.Text = tostring(math.floor(hum.Health))
+					o.hpText.Size = UDim2.fromOffset(40, 14)
+					o.hpText.Position = UDim2.fromOffset(cx - w / 2 - 42, top + h / 2 - 7)
+				end
+			end
+		end
+		o.box.Visible = visible
+		o.barBg.Visible = visible
+		o.hpText.Visible = visible
+	end
+end)
+
+-- ===== CERRAR (apaga todo, restaura y destruye el panel) =====
+connect(closeBtn.MouseButton1Click, function()
+	local fpsWasOn = state.FPSBoost
+	local rageWasOn = state.RageBot
+	for k in pairs(state) do state[k] = false end
+
+	-- Soltar clicks y volver a tu posición si el RageBot estaba en medio de un objetivo
+	if rageWasOn then rageStop(true) end
+	holdFire(false)
+	holdAim(false)
+
+	if fpsWasOn then setFPSBoost(false) end
+
+	restoreArms()
+	local _, myHum = getChar(player)
+	if autoRotateBackup ~= nil and myHum then
+		myHum.AutoRotate = autoRotateBackup
+		autoRotateBackup = nil
+	end
+
+	RunService:UnbindFromRenderStep("GUIXFREE_Aimbot")
+	RunService:UnbindFromRenderStep("GUIXFREE_AimArms")
+	RunService:UnbindFromRenderStep("GUIXFREE_RageStick")
+	for _, c in ipairs(connections) do c:Disconnect() end
+	table.clear(connections)
+	gui:Destroy()
+end)
