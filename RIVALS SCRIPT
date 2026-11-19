@@ -1,19 +1,216 @@
 --[[
-    GUI X FREE
-    Panel de pruebas para TU juego en Roblox Studio.
-    RightShift = mostrar/ocultar | "–" = minimizar | "✕" = cerrar y apagar todo
+    GUI X FREE  (TODO EN UNO)
+    Pega ESTE MISMO código en:
+      • un Script       -> ServerScriptService
+      • un LocalScript  -> StarterPlayer > StarterPlayerScripts
 
-    OPCIONES:
-    • AIMBOT      -> apunta solo a la cabeza; cuerpo y manos siguen
+    SERVIDOR: crea los RemoteEvents, valida el AIM, hace el raycast, dibuja la bala y aplica el daño.
+    CLIENTE : panel + disparo con tus Tools (manda hacia dónde apuntas).
+
+    RightShift = mostrar/ocultar | Q = activar/desactivar AIMBOT | "–" = minimizar | "✕" = cerrar y apagar todo
+
+    OPCIONES DEL PANEL:
+    • AIMBOT      -> (tecla Q lo deja encendido/apagado) SIN apuntar: en cuanto ve a un enemigo (sin paredes
+                     en medio) la cámara va DIRECTO a su CABEZA, de lejos y de cerca (solo cabeza, nunca el
+                     cuerpo). Si estás pegado/dentro de una pared o hay una pared en medio, NO apunta a ningún
+                     lado. Si prefieres que solo actúe con click derecho: AIMBOT_REQUIRE_RIGHT_CLICK = true.
     • RAGEBOT     -> TP a la espalda del más cercano, mantiene click izquierdo (disparar)
                      y click derecho (apuntar) hasta que muere; luego vuelve a tu posición
-    • TRIGGER BOT -> saca el arma con balas (arma 1, luego arma 2) y dispara al apuntar a alguien
+    • TRIGGER BOT -> en cuanto tu mira toca a un enemigo dispara DIRECTO (saca el arma con balas si hace falta);
+                     cuando la mira se aparta del enemigo deja de disparar.
     • ESP         -> caja 2D + barra de vida
     • FPS BOOST   -> baja efectos y calidad para subir FPS
+    • AIM         -> círculo ROJO ajustable. Si hay un enemigo DENTRO del círculo (y se ve, sin paredes),
+                     tu cámara hace un barrido RÁPIDO y visible hasta su CABEZA o su CUERPO (lo eliges con
+                     los botones CABEZA / CUERPO debajo del deslizador). El servidor redirige a esa misma
+                     parte las balas que iban a fallar. Tú controlas el tiempo con AIM_SLIDE_TIME.
+    • NOCLIP      -> traspasas paredes y objetos (al apagarlo vuelve la colisión normal).
+    • FLY         -> vuelas: W/A/S/D se mueven hacia donde mira la cámara, ESPACIO sube, CTRL IZQ baja.
+    • LISTA DE JUGADORES -> abajo del todo se ve cuántas personas hay en el servidor, con un botón
+                     "IGNORAR" por cada una. Al jugador que marques como ignorado, el AIMBOT, el AIM
+                     (círculo) y el RAGEBOT lo ignoran por completo (no le apuntan ni lo persiguen);
+                     TriggerBot y ESP no se ven afectados por esta lista.
 ]]
 
-local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local HINT_REMOTE_NAME = "GUIXFREE_AimHint"
+local SHOOT_REMOTE_NAME = "GUIXFREE_Shoot"
+
+-- =====================================================================
+-- ======================= PARTE DEL SERVIDOR ==========================
+-- =====================================================================
+if RunService:IsServer() then
+	local TweenService = game:GetService("TweenService")
+	local Debris = game:GetService("Debris")
+
+	-- ===== CONFIG SERVIDOR =====
+	local SERVER_ALLOWED = {
+		-- [123456789] = true,  -- pon tu UserId y el de tus testers
+	}
+	local ALLOW_IN_STUDIO = true   -- en Studio lo puede usar cualquiera que pruebe
+	local HINT_TTL = 0.4           -- segundos que vale un aviso del panel
+	local MAX_RANGE = 500          -- alcance máximo de la bala
+	local MAX_ANGLE_DEG = 30       -- el objetivo debe estar a menos de este ángulo de donde apuntaste
+	local DAMAGE = 25
+	local HEADSHOT_MULT = 2
+	local FIRE_RATE = 0.08         -- mínimo entre disparos (anti-spam)
+	local BULLET_SPEED = 700       -- studs/seg (visual)
+	local TRACER_LENGTH = 10       -- largo de la bala que se ve (rápida y alargada)
+	local TRACER_COLOR = Color3.fromRGB(255, 220, 120)
+
+	local function getOrCreateRemote(name)
+		local r = ReplicatedStorage:FindFirstChild(name)
+		if not r then
+			r = Instance.new("RemoteEvent")
+			r.Name = name
+			r.Parent = ReplicatedStorage
+		end
+		return r
+	end
+
+	local hintRemote = getOrCreateRemote(HINT_REMOTE_NAME)
+	local shootRemote = getOrCreateRemote(SHOOT_REMOTE_NAME)
+
+	local hints = {}
+	local lastShot = {}
+
+	local function isAllowed(plr)
+		return SERVER_ALLOWED[plr.UserId] == true or (ALLOW_IN_STUDIO and RunService:IsStudio())
+	end
+
+	-- Aviso del panel: "este es el enemigo dentro del círculo y esta es la parte"
+	hintRemote.OnServerEvent:Connect(function(plr, targetName, partName)
+		if not isAllowed(plr) then return end
+
+		if targetName == nil then
+			hints[plr] = nil -- nadie dentro del círculo: no hacer nada
+			return
+		end
+		if typeof(targetName) ~= "string" or (partName ~= "Head" and partName ~= "Body") then return end
+
+		local target = Players:FindFirstChild(targetName)
+		if target and target:IsA("Player") and target ~= plr then
+			hints[plr] = { target = target, part = partName, t = os.clock() }
+		end
+	end)
+
+	Players.PlayerRemoving:Connect(function(plr)
+		hints[plr] = nil
+		lastShot[plr] = nil
+	end)
+
+	local function playerFromHit(inst)
+		local model = inst and inst:FindFirstAncestorOfClass("Model")
+		return model and Players:GetPlayerFromCharacter(model)
+	end
+
+	-- Devuelve la dirección final del disparo. Solo cambia algo si la bala iba a FALLAR.
+	local function resolveAim(plr, origin, direction, params)
+		direction = direction.Unit
+
+		-- 1) Si la bala ya iba a darle a un jugador, no se toca
+		local straight = workspace:Raycast(origin, direction * MAX_RANGE, params)
+		if straight and playerFromHit(straight.Instance) then
+			return direction
+		end
+
+		-- 2) ¿Hay un aviso vigente del panel?
+		local h = hints[plr]
+		if not h or os.clock() - h.t > HINT_TTL then return direction end
+
+		-- 3) El objetivo tiene que seguir vivo (si murió o se fue, no hace nada)
+		local char = h.target.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not (hum and hum.Health > 0) then
+			hints[plr] = nil
+			return direction
+		end
+
+		local part
+		if h.part == "Head" then
+			part = char:FindFirstChild("Head")
+		end
+		part = part or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or char:FindFirstChild("HumanoidRootPart")
+		if not part then return direction end
+
+		-- 4) Distancia y ángulo (el "círculo" validado por el servidor)
+		local toPart = part.Position - origin
+		if toPart.Magnitude > MAX_RANGE or toPart.Magnitude < 0.1 then return direction end
+		local angle = math.deg(math.acos(math.clamp(direction:Dot(toPart.Unit), -1, 1)))
+		if angle > MAX_ANGLE_DEG then return direction end
+
+		-- 5) Línea de visión comprobada por el servidor
+		local los = workspace:Raycast(origin, toPart, params)
+		if los and not los.Instance:IsDescendantOf(char) then return direction end
+
+		return toPart.Unit
+	end
+
+	-- Disparo: el cliente solo manda hacia dónde apuntas
+	shootRemote.OnServerEvent:Connect(function(plr, aimDirection)
+		if typeof(aimDirection) ~= "Vector3" or aimDirection.Magnitude < 0.01 then return end
+
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local head = char and char:FindFirstChild("Head")
+		if not (hum and head and hum.Health > 0) then return end
+		if not char:FindFirstChildOfClass("Tool") then return end -- solo si tiene un arma en la mano
+
+		local now = os.clock()
+		if lastShot[plr] and now - lastShot[plr] < FIRE_RATE then return end
+		lastShot[plr] = now
+
+		local origin = head.Position
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { char }
+		params.IgnoreWater = true
+
+		local direction = resolveAim(plr, origin, aimDirection, params)
+
+		local result = workspace:Raycast(origin, direction * MAX_RANGE, params)
+		local hitPos = result and result.Position or (origin + direction * MAX_RANGE)
+
+		-- Bala visual rápida y alargada
+		local dist = (hitPos - origin).Magnitude
+		local base = CFrame.lookAt(origin, hitPos)
+		local tracer = Instance.new("Part")
+		tracer.Anchored = true
+		tracer.CanCollide = false
+		tracer.CanQuery = false
+		tracer.CanTouch = false
+		tracer.Material = Enum.Material.Neon
+		tracer.Color = TRACER_COLOR
+		tracer.Size = Vector3.new(0.12, 0.12, TRACER_LENGTH)
+		tracer.CFrame = base * CFrame.new(0, 0, -TRACER_LENGTH / 2)
+		tracer.Parent = workspace
+		local travel = math.max(dist / BULLET_SPEED, 0.02)
+		TweenService:Create(tracer, TweenInfo.new(travel, Enum.EasingStyle.Linear),
+			{ CFrame = base * CFrame.new(0, 0, -(dist + TRACER_LENGTH / 2)) }):Play()
+		Debris:AddItem(tracer, travel + 0.05)
+
+		-- Daño (lo calcula el servidor)
+		if result then
+			local victimChar = result.Instance:FindFirstAncestorOfClass("Model")
+			local victimHum = victimChar and victimChar:FindFirstChildOfClass("Humanoid")
+			if victimHum and victimHum.Health > 0 and victimChar ~= char then
+				victimHum:TakeDamage(result.Instance.Name == "Head" and DAMAGE * HEADSHOT_MULT or DAMAGE)
+			end
+		end
+	end)
+
+	print("[GUI X FREE] servidor listo")
+	return -- fin de la parte del servidor
+end
+
+-- =====================================================================
+-- ======================= PARTE DEL CLIENTE ===========================
+-- =====================================================================
+print("[GUI X FREE] cargando panel...")
+
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Lighting = game:GetService("Lighting")
@@ -21,15 +218,21 @@ local Lighting = game:GetService("Lighting")
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
 
--- ===== CONFIG =====
+-- ===== CONFIG DEL PANEL =====
+-- Solo los UserId de esta lista pueden usar el panel (pon el tuyo y el de tus testers)
 local ALLOWED = {
-	[player.UserId] = true, -- cambia por tu UserId real si quieres restringirlo
+	[player.UserId] = true,
 }
 if not ALLOWED[player.UserId] then return end
 
 local TOGGLE_KEY = Enum.KeyCode.RightShift
+local AIMBOT_KEY = Enum.KeyCode.Q   -- tecla para dejar el AIMBOT encendido / apagado
 local TRIGGER_RANGE = 300
 local TRIGGER_DEBUG = true      -- imprime en el Output por qué dispara o no dispara
+
+-- Disparo de los Tools (manda hacia dónde apuntas; no mueve tu cámara ni tus manos)
+local GUN_TOOL_NAMES = {}       -- vacío = todos los Tools disparan. Ej: { "Pistola", "Rifle" }
+local GUN_FIRE_INTERVAL = 0.09  -- debe ser >= FIRE_RATE del servidor
 
 -- RageBot
 local BEHIND_DISTANCE = 2                   -- studs detrás de la espalda (más bajo = más pegado)
@@ -42,16 +245,39 @@ local RAGE_FIRE_ATTRIBUTE = "GUIXFREE_Fire" -- atributo del jugador: true = clic
 local RAGE_AIM_ATTRIBUTE = "GUIXFREE_Aim"   -- atributo del jugador: true = click derecho apretado
 local RAGE_USE_VIM = true                   -- intenta apretar los clicks reales (puede estar bloqueado)
 
--- Brazos / manos
+-- AIM (círculo rojo + deslizamiento a la cabeza)
+local AIM_CIRCLE_MIN = 60                   -- diámetro mínimo del círculo (px)
+local AIM_CIRCLE_MAX = 600                  -- diámetro máximo del círculo (px)
+local AIM_CIRCLE_START = 220                -- diámetro inicial (px)
+local AIM_SLIDE_TIME = 0.12                  -- segundos que tarda en deslizarse hasta la cabeza (0.05 = casi instantáneo, 0.12 = rápido y se nota, 0.3 = lento)
+local AIM_SLIDE_REQUIRES_CLICK = false      -- true = solo se desliza mientras mantienes el click izquierdo (disparar)
+local AIM_TARGET_PART = "Head"              -- parte inicial del botón AIM: "Head" (cabeza) o "Body" (cuerpo). Se cambia con los botones del panel
+local AIM_WALLCHECK = true                  -- true = solo cuenta enemigos que se ven (sin paredes en medio)
+local AIM_COLOR = Color3.fromRGB(255, 40, 40)     -- círculo rojo normal
+local AIM_COLOR_LOCK = Color3.fromRGB(255, 0, 0)  -- rojo fuerte cuando hay un enemigo dentro
+local AIM_HINT_INTERVAL = 0.1               -- cada cuántos segundos avisa al servidor (y sortea cabeza/cuerpo)
+local AIM_DEBUG = true                      -- avisa en el Output si falta el RemoteEvent del servidor
+
+-- Aimbot (tecla Q + click derecho) -> SOLO CABEZA
+local AIMBOT_REQUIRE_RIGHT_CLICK = false -- false = apunta a la cabeza EN CUANTO VE al enemigo (sin apuntar); true = solo con click derecho
+local AIMBOT_WALLCHECK = true            -- true = no apunta si hay una pared entre tú y el enemigo
+local AIMBOT_BLOCK_IN_WALL = true        -- true = si estás pegado/dentro de una pared NO apunta a ningún lado
+local AIMBOT_WALL_RADIUS = 1.2           -- studs alrededor de tu cabeza que cuentan como "estoy en la pared"
+-- (el aimbot NO tiene límite de distancia: apunta a la cabeza de lejos y de cerca)
+
+-- Brazos / manos (solo Aimbot / RageBot)
 local ARMS_AIM = true        -- true = el aimbot también mueve brazos/manos hacia la cabeza
 local ARM_PITCH_MULT = 1     -- 1 = ángulo exacto. Sube/baja si las manos quedan cortas o pasadas
 local ARM_PITCH_OFFSET = 0   -- en radianes, para corregir un poco (ej: math.rad(-5))
+
+-- Fly
+local FLY_SPEED = 60       -- velocidad de vuelo en studs/seg (más alto = más rápido)
 
 -- ===== CONFIG DE MUNICIÓN / ARMAS =====
 -- Si ya sabes el nombre EXACTO del valor de munición de tus armas, ponlo aquí (ej: "Ammo").
 -- Si lo dejas en nil, el script lo detecta solo y te dice en el Output cuál encontró.
 local AMMO_NAME = nil
--- Orden de armas por nombre de Tool (opcional). Ej: { "Pistola", "Rifle" }
+-- Orden de armas por nombre de Tool (opcional). Ej: { "Pistola", "Revolver" }
 local WEAPON_ORDER = {}
 local AMMO_KEYWORDS = { "ammo", "bullet", "clip", "muni", "bala", "cartuch", "magazine", "rounds" }
 local AMMO_EXCLUDE = { "max", "capacity", "maximum" }
@@ -70,7 +296,11 @@ local THEME = {
 }
 
 -- ===== ESTADO =====
-local state = { Aimbot = false, RageBot = false, TriggerBot = false, ESP = false, FPSBoost = false }
+local state = { Aimbot = false, RageBot = false, TriggerBot = false, ESP = false, FPSBoost = false, AIM = false, Noclip = false, Fly = false }
+
+-- Jugadores que el AIMBOT, el AIM (círculo) y el RAGEBOT ignoran por completo
+-- (no les apuntan ni los persiguen), aunque los veas. TriggerBot y ESP NO usan esta lista.
+local ignored = {}
 
 local connections = {}
 local function connect(signal, fn)
@@ -96,7 +326,7 @@ local function getNearestPlayer()
 	if not myChar then return end
 	local best, bestDist
 	for _, p in ipairs(Players:GetPlayers()) do
-		if p ~= player then
+		if p ~= player and not ignored[p] then
 			local c, _, root = getChar(p)
 			if c then
 				local d = (root.Position - myRoot.Position).Magnitude
@@ -120,11 +350,205 @@ local function tween(obj, props, t)
 	TweenService:Create(obj, TweenInfo.new(t or 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
 end
 
+-- ===== AIM: CÍRCULO + AVISO AL SERVIDOR =====
+local aimDiameter = AIM_CIRCLE_START
+local aimPart = AIM_TARGET_PART -- "Head" o "Body" (lo cambian los botones CABEZA / CUERPO)
+
+-- Centro del círculo: el centro de la pantalla (mira) o el mouse si lo tienes libre
+local function aimCenter()
+	if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+		return camera.ViewportSize / 2
+	end
+	return UserInputService:GetMouseLocation()
+end
+
+local function bodyPartOf(char, root)
+	return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or root
+end
+
+-- ¿Se ve esa parte desde tu cámara (sin paredes en medio)?
+local function isVisible(part, targetChar, myChar)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { myChar, camera }
+	params.IgnoreWater = true
+	local from = camera.CFrame.Position
+	local r = workspace:Raycast(from, part.Position - from, params)
+	return r == nil or r.Instance:IsDescendantOf(targetChar)
+end
+
+-- Enemigo más cercano al centro del círculo (dentro del círculo). Ignora a los jugadores marcados
+-- como ignorados en la lista del panel. Devuelve: player, character, head, body
+local function getAimTarget()
+	local myChar = getChar(player)
+	if not myChar then return end
+
+	local center = aimCenter()
+	local radius = aimDiameter / 2
+	local bestP, bestC, bestHead, bestBody, bestDist
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player and not ignored[p] then
+			local c, _, root, head = getChar(p)
+			if c then
+				local body = bodyPartOf(c, root)
+				local dMin
+				for _, part in ipairs({ head, body }) do
+					local sp = camera:WorldToViewportPoint(part.Position)
+					if sp.Z > 0 then
+						local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+						if not dMin or d < dMin then dMin = d end
+					end
+				end
+
+				if dMin and dMin <= radius and (not bestDist or dMin < bestDist) then
+					if not AIM_WALLCHECK or isVisible(head, c, myChar) or isVisible(body, c, myChar) then
+						bestP, bestC, bestHead, bestBody, bestDist = p, c, head, body, dMin
+					end
+				end
+			end
+		end
+	end
+
+	return bestP, bestC, bestHead, bestBody
+end
+
+-- ¿Estás pegado o dentro de una pared? (alguna parte sólida que no sea un jugador toca tu cabeza)
+local function inWall(myChar)
+	local myHead = myChar:FindFirstChild("Head")
+	if not myHead then return false end
+
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	op.FilterDescendantsInstances = { myChar, camera }
+	op.RespectCanCollide = true
+
+	local parts = workspace:GetPartBoundsInRadius(myHead.Position, AIMBOT_WALL_RADIUS, op)
+	for _, part in ipairs(parts) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		local isPlayerPart = model and Players:GetPlayerFromCharacter(model)
+		if not isPlayerPart then
+			return true
+		end
+	end
+	return false
+end
+
+-- ¿Hay una pared que bloquee el aimbot hacia esa cabeza?
+--  • estás pegado/dentro de una pared
+--  • hay una pared entre tu cámara y la cabeza
+--  • hay una pared entre tu cabeza y la cabeza del enemigo
+local function aimbotBlocked(head, targetChar, myChar)
+	if AIMBOT_BLOCK_IN_WALL and inWall(myChar) then
+		return true
+	end
+	if not AIMBOT_WALLCHECK then return false end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { myChar, camera }
+	params.IgnoreWater = true
+	params.RespectCanCollide = true
+
+	-- cámara → cabeza enemiga
+	local from = camera.CFrame.Position
+	local r1 = workspace:Raycast(from, head.Position - from, params)
+	if r1 and not r1.Instance:IsDescendantOf(targetChar) then
+		return true
+	end
+
+	-- tu cabeza → cabeza enemiga
+	local myHead = myChar:FindFirstChild("Head")
+	if myHead then
+		local from2 = myHead.Position
+		local r2 = workspace:Raycast(from2, head.Position - from2, params)
+		if r2 and not r2.Instance:IsDescendantOf(targetChar) then
+			return true
+		end
+	end
+
+	return false
+end
+
+-- Objetivo del AIMBOT: el enemigo cuya CABEZA está más cerca del CENTRO de tu pantalla.
+--  • SIN límite de distancia (de lejos y de cerca)
+--  • Si estás en la pared o hay una pared en medio, no devuelve a nadie → no apunta a ningún lado
+--  • Ignora a los jugadores marcados como ignorados en la lista del panel
+local function getAimbotTarget()
+	local myChar = getChar(player)
+	if not myChar then return end
+
+	local center = camera.ViewportSize / 2
+	local best, bestDist
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player and not ignored[p] then
+			local c, _, _, head = getChar(p)
+			if c then
+				-- Solo hace falta que esté DELANTE de la cámara (Z > 0). No se exige que esté dentro de la
+				-- pantalla, así también funciona cuando está muy cerca y su cabeza queda fuera de cuadro.
+				local sp = camera:WorldToViewportPoint(head.Position)
+				if sp.Z > 0 then
+					local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+					if (not bestDist or d < bestDist) and not aimbotBlocked(head, c, myChar) then
+						best, bestDist = p, d
+					end
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+-- Aviso al servidor (el servidor solo lo usa si la bala iba a fallar, y lo valida él mismo)
+-- Nunca se queda esperando: si el RemoteEvent no existe, avisa una vez y sigue.
+local hintRemote = nil
+local hintActive = false
+local lastHintSent = 0
+local warnedNoRemote = false
+
+local function sendHint(targetName, partName)
+	if not hintRemote or not hintRemote.Parent then
+		hintRemote = ReplicatedStorage:FindFirstChild(HINT_REMOTE_NAME)
+	end
+	if not hintRemote then
+		if AIM_DEBUG and not warnedNoRemote then
+			warnedNoRemote = true
+			warn("[GUI X FREE][AIM] no encuentro el RemoteEvent '" .. HINT_REMOTE_NAME
+				.. "'. Falta pegar este mismo código como Script en ServerScriptService.")
+		end
+		return
+	end
+	hintRemote:FireServer(targetName, partName)
+end
+
+local function updateAimHint(target)
+	if not target then
+		if hintActive then
+			hintActive = false
+			sendHint(nil, nil) -- nadie dentro: el servidor deja de hacer nada
+		end
+		return
+	end
+
+	local now = os.clock()
+	if now - lastHintSent >= AIM_HINT_INTERVAL then
+		lastHintSent = now
+		hintActive = true
+		local part = aimPart
+		sendHint(target.Name, part)
+	end
+end
+
 -- ===== RAGEBOT: CLICKS MANTENIDOS =====
 local rageTarget = nil
 local rageOrigin = nil
 local rageCooldownUntil = 0
 local rageStop = nil
+local triggerStop = nil   -- se define más abajo (suelta el disparo del TriggerBot)
+local stopFly = nil       -- se define más abajo (apaga el vuelo)
+local restoreNoclip = nil -- se define más abajo (devuelve la colisión)
 local heldTool = nil
 
 local VIM = nil
@@ -391,8 +815,11 @@ local nextOrder = 0
 
 local function getTools(char)
 	local list = {}
-	for _, t in ipairs(player.Backpack:GetChildren()) do
-		if t:IsA("Tool") then table.insert(list, t) end
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if backpack then
+		for _, t in ipairs(backpack:GetChildren()) do
+			if t:IsA("Tool") then table.insert(list, t) end
+		end
 	end
 	local eq = char:FindFirstChildOfClass("Tool")
 	if eq then table.insert(list, eq) end
@@ -438,10 +865,11 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "GUI_X_FREE"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
 gui.Parent = player:WaitForChild("PlayerGui")
 
 local HEADER_H = 46
-local BODY_H = 300
+local BODY_H = 780
 local FULL_H = HEADER_H + BODY_H
 
 local frame = Instance.new("Frame")
@@ -561,6 +989,9 @@ bodyLayout.Padding = UDim.new(0, 8)
 bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
 bodyLayout.Parent = body
 
+-- Guarda la función que actualiza cada interruptor (para poder moverlo desde una tecla)
+local toggleRefresh = {}
+
 local function makeToggle(name, label, subtitle, order, onChange)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 46)
@@ -625,6 +1056,7 @@ local function makeToggle(name, label, subtitle, order, onChange)
 		tween(knob, { Position = on and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3) })
 		tween(rowStroke, { Color = on and THEME.on or Color3.fromRGB(45, 45, 65) })
 	end
+	toggleRefresh[name] = refresh
 
 	connect(click.MouseButton1Click, function()
 		state[name] = not state[name]
@@ -635,23 +1067,362 @@ local function makeToggle(name, label, subtitle, order, onChange)
 	connect(click.MouseLeave, function() tween(row, { BackgroundColor3 = THEME.row }, 0.15) end)
 end
 
-makeToggle("Aimbot", "AIMBOT", "Cabeza + manos siguen", 1)
+makeToggle("Aimbot", "AIMBOT [Q]", "Lo ve → cabeza directo", 1)
 makeToggle("RageBot", "RAGEBOT", "TP, click izq + der, mata", 2, function(on)
 	-- Al apagarlo: soltar los clicks y volver a tu posición original
 	if not on and rageStop then rageStop(true) end
 end)
-makeToggle("TriggerBot", "TRIGGER BOT", "Saca arma 1, luego arma 2", 3)
+makeToggle("TriggerBot", "TRIGGER BOT", "Dispara directo al verlo", 3, function(on)
+	-- Al apagarlo: soltar el disparo
+	if not on and triggerStop then triggerStop() end
+end)
 makeToggle("ESP", "ESP", "Caja 2D + barra de vida", 4)
 makeToggle("FPSBoost", "FPS BOOST", "Menos efectos, más FPS", 5, setFPSBoost)
+makeToggle("AIM", "AIM", "Círculo → cabeza o cuerpo", 6)
+
+-- ===== CÍRCULO AIM (ROJO) + DESLIZADOR DE TAMAÑO =====
+local aimCircle = Instance.new("Frame")
+aimCircle.Name = "AimCircle"
+aimCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+aimCircle.Size = UDim2.fromOffset(aimDiameter, aimDiameter)
+aimCircle.BackgroundTransparency = 1
+aimCircle.BorderSizePixel = 0
+aimCircle.Visible = false
+aimCircle.Parent = gui
+
+local aimCircleCorner = Instance.new("UICorner")
+aimCircleCorner.CornerRadius = UDim.new(0.5, 0) -- círculo perfecto
+aimCircleCorner.Parent = aimCircle
+
+local aimStroke = Instance.new("UIStroke")
+aimStroke.Thickness = 2
+aimStroke.Color = AIM_COLOR
+aimStroke.Parent = aimCircle
+
+-- Fila del deslizador
+local sliderRow = Instance.new("Frame")
+sliderRow.Size = UDim2.new(1, 0, 0, 56)
+sliderRow.BackgroundColor3 = THEME.row
+sliderRow.BorderSizePixel = 0
+sliderRow.LayoutOrder = 7
+sliderRow.Parent = body
+corner(sliderRow, 10)
+
+local sliderStroke = Instance.new("UIStroke")
+sliderStroke.Color = Color3.fromRGB(45, 45, 65)
+sliderStroke.Thickness = 1
+sliderStroke.Parent = sliderRow
+
+local sliderLabel = Instance.new("TextLabel")
+sliderLabel.Size = UDim2.new(1, -90, 0, 20)
+sliderLabel.Position = UDim2.fromOffset(12, 6)
+sliderLabel.BackgroundTransparency = 1
+sliderLabel.Text = "TAMAÑO DEL CÍRCULO"
+sliderLabel.TextColor3 = THEME.text
+sliderLabel.Font = Enum.Font.GothamBold
+sliderLabel.TextSize = 12
+sliderLabel.TextXAlignment = Enum.TextXAlignment.Left
+sliderLabel.Parent = sliderRow
+
+local sliderValue = Instance.new("TextLabel")
+sliderValue.Size = UDim2.fromOffset(70, 20)
+sliderValue.Position = UDim2.new(1, -82, 0, 6)
+sliderValue.BackgroundTransparency = 1
+sliderValue.Text = ""
+sliderValue.TextColor3 = AIM_COLOR
+sliderValue.Font = Enum.Font.GothamBold
+sliderValue.TextSize = 12
+sliderValue.TextXAlignment = Enum.TextXAlignment.Right
+sliderValue.Parent = sliderRow
+
+local sliderTrack = Instance.new("Frame")
+sliderTrack.Size = UDim2.new(1, -28, 0, 6)
+sliderTrack.Position = UDim2.fromOffset(14, 38)
+sliderTrack.BackgroundColor3 = THEME.off
+sliderTrack.BorderSizePixel = 0
+sliderTrack.Parent = sliderRow
+corner(sliderTrack, 3)
+
+local sliderFill = Instance.new("Frame")
+sliderFill.Size = UDim2.new(0, 0, 1, 0)
+sliderFill.BackgroundColor3 = AIM_COLOR
+sliderFill.BorderSizePixel = 0
+sliderFill.Parent = sliderTrack
+corner(sliderFill, 3)
+
+local sliderKnob = Instance.new("Frame")
+sliderKnob.Size = UDim2.fromOffset(16, 16)
+sliderKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+sliderKnob.Position = UDim2.new(0, 0, 0.5, 0)
+sliderKnob.BackgroundColor3 = Color3.new(1, 1, 1)
+sliderKnob.BorderSizePixel = 0
+sliderKnob.Parent = sliderTrack
+corner(sliderKnob, 8)
+
+local sliderHit = Instance.new("TextButton")
+sliderHit.Size = UDim2.new(1, -16, 0, 28)
+sliderHit.Position = UDim2.fromOffset(8, 27)
+sliderHit.BackgroundTransparency = 1
+sliderHit.Text = ""
+sliderHit.Parent = sliderRow
+
+local function updateSliderVisual()
+	local frac = (aimDiameter - AIM_CIRCLE_MIN) / (AIM_CIRCLE_MAX - AIM_CIRCLE_MIN)
+	sliderFill.Size = UDim2.new(frac, 0, 1, 0)
+	sliderKnob.Position = UDim2.new(frac, 0, 0.5, 0)
+	sliderValue.Text = tostring(aimDiameter) .. " px"
+end
+
+local function setAimDiameter(d)
+	aimDiameter = math.clamp(math.floor(d + 0.5), AIM_CIRCLE_MIN, AIM_CIRCLE_MAX)
+	aimCircle.Size = UDim2.fromOffset(aimDiameter, aimDiameter)
+	updateSliderVisual()
+end
+setAimDiameter(aimDiameter)
+
+local sliderDragging = false
+local function setFromX(x)
+	local frac = math.clamp((x - sliderTrack.AbsolutePosition.X) / sliderTrack.AbsoluteSize.X, 0, 1)
+	setAimDiameter(AIM_CIRCLE_MIN + (AIM_CIRCLE_MAX - AIM_CIRCLE_MIN) * frac)
+end
+
+connect(sliderHit.InputBegan, function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		sliderDragging = true
+		setFromX(input.Position.X)
+	end
+end)
+connect(UserInputService.InputChanged, function(input)
+	if sliderDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		setFromX(input.Position.X)
+	end
+end)
+connect(UserInputService.InputEnded, function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		sliderDragging = false
+	end
+end)
+
+-- ===== BOTONES: CABEZA / CUERPO (a dónde apunta el botón AIM) =====
+local partRow = Instance.new("Frame")
+partRow.Size = UDim2.new(1, 0, 0, 46)
+partRow.BackgroundColor3 = THEME.row
+partRow.BorderSizePixel = 0
+partRow.LayoutOrder = 8
+partRow.Parent = body
+corner(partRow, 10)
+
+local partStroke = Instance.new("UIStroke")
+partStroke.Color = Color3.fromRGB(45, 45, 65)
+partStroke.Thickness = 1
+partStroke.Parent = partRow
+
+local partLabel = Instance.new("TextLabel")
+partLabel.Size = UDim2.new(1, -170, 1, 0)
+partLabel.Position = UDim2.fromOffset(12, 0)
+partLabel.BackgroundTransparency = 1
+partLabel.Text = "AIM APUNTA A"
+partLabel.TextColor3 = THEME.text
+partLabel.Font = Enum.Font.GothamBold
+partLabel.TextSize = 12
+partLabel.TextXAlignment = Enum.TextXAlignment.Left
+partLabel.Parent = partRow
+
+local function makePartButton(text, xOffset, width)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(width, 30)
+	b.Position = UDim2.new(1, xOffset, 0.5, -15)
+	b.BackgroundColor3 = Color3.fromRGB(40, 40, 58)
+	b.Text = text
+	b.TextColor3 = THEME.text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.AutoButtonColor = false
+	b.Parent = partRow
+	corner(b, 8)
+	return b
+end
+
+local headBtn = makePartButton("CABEZA", -156, 72)
+local bodyBtn = makePartButton("CUERPO", -78, 66)
+
+local PART_ON = Color3.fromRGB(200, 40, 40)
+local PART_OFF = Color3.fromRGB(40, 40, 58)
+
+local function refreshPartButtons()
+	tween(headBtn, { BackgroundColor3 = aimPart == "Head" and PART_ON or PART_OFF }, 0.15)
+	tween(bodyBtn, { BackgroundColor3 = aimPart == "Body" and PART_ON or PART_OFF }, 0.15)
+end
+refreshPartButtons()
+
+connect(headBtn.MouseButton1Click, function()
+	aimPart = "Head"
+	refreshPartButtons()
+end)
+connect(bodyBtn.MouseButton1Click, function()
+	aimPart = "Body"
+	refreshPartButtons()
+end)
+
+makeToggle("Noclip", "NOCLIP", "Traspasar paredes", 9, function(on)
+	if not on and restoreNoclip then restoreNoclip() end
+end)
+makeToggle("Fly", "FLY", "Volar: WASD, Espacio, Ctrl", 10, function(on)
+	if not on and stopFly then stopFly() end
+end)
+
+-- ===== LISTA DE JUGADORES: cuántos hay y a quiénes ignoran el AIMBOT / AIM =====
+local playerCountLabel = Instance.new("TextLabel")
+playerCountLabel.Size = UDim2.new(1, 0, 0, 20)
+playerCountLabel.BackgroundTransparency = 1
+playerCountLabel.Text = "JUGADORES EN EL SERVIDOR: 0"
+playerCountLabel.TextColor3 = THEME.text
+playerCountLabel.Font = Enum.Font.GothamBold
+playerCountLabel.TextSize = 12
+playerCountLabel.TextXAlignment = Enum.TextXAlignment.Left
+playerCountLabel.LayoutOrder = 11
+playerCountLabel.Parent = body
+
+local playersList = Instance.new("ScrollingFrame")
+playersList.Size = UDim2.new(1, 0, 0, 150)
+playersList.BackgroundColor3 = THEME.row
+playersList.BorderSizePixel = 0
+playersList.Active = true
+playersList.ScrollingDirection = Enum.ScrollingDirection.Y
+playersList.ScrollBarThickness = 5
+playersList.ScrollBarImageColor3 = THEME.accent
+playersList.CanvasSize = UDim2.new(0, 0, 0, 0)
+playersList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+playersList.LayoutOrder = 12
+playersList.Parent = body
+corner(playersList, 10)
+
+local playersListStroke = Instance.new("UIStroke")
+playersListStroke.Color = Color3.fromRGB(45, 45, 65)
+playersListStroke.Thickness = 1
+playersListStroke.Parent = playersList
+
+local playersListPad = Instance.new("UIPadding")
+playersListPad.PaddingTop = UDim.new(0, 6)
+playersListPad.PaddingBottom = UDim.new(0, 6)
+playersListPad.PaddingLeft = UDim.new(0, 8)
+playersListPad.PaddingRight = UDim.new(0, 8)
+playersListPad.Parent = playersList
+
+local playersListLayout = Instance.new("UIListLayout")
+playersListLayout.Padding = UDim.new(0, 4)
+playersListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+playersListLayout.Parent = playersList
+
+local playerRows = {} -- [Player] = { row = Frame, button = TextButton }
+
+local function updatePlayerCount()
+	playerCountLabel.Text = "JUGADORES EN EL SERVIDOR: " .. tostring(#Players:GetPlayers())
+end
+
+local function refreshPlayerRow(p)
+	local info = playerRows[p]
+	if not info then return end
+	local on = ignored[p] == true
+	tween(info.button, { BackgroundColor3 = on and Color3.fromRGB(200, 40, 40) or Color3.fromRGB(40, 40, 58) }, 0.15)
+	info.button.Text = on and "IGNORADO" or "IGNORAR"
+end
+
+local function createPlayerRow(p)
+	if p == player or playerRows[p] then return end
+
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 30)
+	row.BackgroundTransparency = 1
+	row.Parent = playersList
+
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.Size = UDim2.new(1, -84, 1, 0)
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Text = p.Name
+	nameLbl.TextColor3 = THEME.text
+	nameLbl.Font = Enum.Font.Gotham
+	nameLbl.TextSize = 13
+	nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+	nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLbl.Parent = row
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.fromOffset(78, 24)
+	btn.Position = UDim2.new(1, -78, 0.5, -12)
+	btn.BackgroundColor3 = Color3.fromRGB(40, 40, 58)
+	btn.Text = "IGNORAR"
+	btn.TextColor3 = THEME.text
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 11
+	btn.AutoButtonColor = false
+	btn.Parent = row
+	corner(btn, 7)
+
+	playerRows[p] = { row = row, button = btn }
+
+	connect(btn.MouseButton1Click, function()
+		if ignored[p] then
+			ignored[p] = nil
+		else
+			ignored[p] = true
+		end
+		refreshPlayerRow(p)
+	end)
+
+	refreshPlayerRow(p)
+end
+
+local function removePlayerRow(p)
+	local info = playerRows[p]
+	if info then
+		info.row:Destroy()
+		playerRows[p] = nil
+	end
+	ignored[p] = nil
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+	createPlayerRow(p)
+end
+updatePlayerCount()
+
+connect(Players.PlayerAdded, function(p)
+	createPlayerRow(p)
+	updatePlayerCount()
+end)
+connect(Players.PlayerRemoving, function(p)
+	removePlayerRow(p)
+	updatePlayerCount()
+end)
+
+-- Mover el círculo, ponerlo rojo fuerte con enemigo dentro y avisar al servidor.
+-- (el deslizamiento de la cámara a la cabeza está más abajo, en "GUIXFREE_AimSlide")
+connect(RunService.RenderStepped, function()
+	aimCircle.Visible = state.AIM
+	if not state.AIM then
+		updateAimHint(nil)
+		return
+	end
+
+	local pos = aimCenter()
+	aimCircle.Position = UDim2.fromOffset(pos.X, pos.Y)
+
+	local target = getAimTarget()
+	aimStroke.Color = target and AIM_COLOR_LOCK or AIM_COLOR
+	aimStroke.Thickness = target and 3 or 2
+
+	updateAimHint(target)
+end)
 
 local footer = Instance.new("TextLabel")
 footer.Size = UDim2.new(1, 0, 0, 16)
 footer.BackgroundTransparency = 1
-footer.Text = "RightShift: ocultar / mostrar"
+footer.Text = "RightShift: ocultar / mostrar  |  Q: aimbot"
 footer.TextColor3 = THEME.subtext
 footer.Font = Enum.Font.Gotham
 footer.TextSize = 11
-footer.LayoutOrder = 6
+footer.LayoutOrder = 13
 footer.Parent = body
 
 -- Minimizar
@@ -670,11 +1441,14 @@ connect(minBtn.MouseButton1Click, function()
 	end
 end)
 
--- Mostrar / ocultar con tecla
+-- Teclas: RightShift = mostrar/ocultar panel | Q = dejar el AIMBOT encendido/apagado
 connect(UserInputService.InputBegan, function(input, gpe)
-	if gpe then return end
+	if gpe then return end -- no se activa si estás escribiendo en el chat
 	if input.KeyCode == TOGGLE_KEY then
 		frame.Visible = not frame.Visible
+	elseif input.KeyCode == AIMBOT_KEY then
+		state.Aimbot = not state.Aimbot
+		if toggleRefresh.Aimbot then toggleRefresh.Aimbot() end
 	end
 end)
 
@@ -713,17 +1487,36 @@ connect(RunService.Stepped, function()
 end)
 
 -- ===== AIMBOT / RAGEBOT: CÁMARA + CUERPO =====
--- Prioridades: personaje (+1) → cámara (200) → aimbot (+1) → tus manos (+2) → brazos del aimbot (+3)
+-- Prioridades: personaje (+1) → cámara (200) → aimbot (+1) → deslizamiento AIM (+2) → tus manos / brazos (+3)
 local AIM_PRIORITY = Enum.RenderPriority.Camera.Value + 1
+local SLIDE_PRIORITY = Enum.RenderPriority.Camera.Value + 2
 local ARMS_PRIORITY = Enum.RenderPriority.Camera.Value + 3
 local autoRotateBackup = nil
 local aimTargetHead = nil
 
+-- ¿Estás manteniendo el click derecho (apuntar)?
+local function rightClickHeld()
+	return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+end
+
+-- ¿Debe actuar ahora el aimbot?
+--  • RageBot: siempre que esté encendido
+--  • Aimbot: encendido (Q / panel) Y, si AIMBOT_REQUIRE_RIGHT_CLICK = true, con el click derecho apretado
+local function aimbotWants()
+	if state.RageBot then return true end
+	if not state.Aimbot then return false end
+	if AIMBOT_REQUIRE_RIGHT_CLICK then
+		return rightClickHeld()
+	end
+	return true
+end
+
 RunService:BindToRenderStep("GUIXFREE_Aimbot", AIM_PRIORITY, function()
 	local myChar, myHum, myRoot = getChar(player)
-	local active = state.Aimbot or state.RageBot
+	local active = aimbotWants()
 
 	if not active then
+		-- Soltaste el click derecho (o está apagado): devolver el control normal
 		aimTargetHead = nil
 		if autoRotateBackup ~= nil and myHum then
 			myHum.AutoRotate = autoRotateBackup
@@ -733,31 +1526,88 @@ RunService:BindToRenderStep("GUIXFREE_Aimbot", AIM_PRIORITY, function()
 	end
 	if not myChar then aimTargetHead = nil return end
 
-	-- El RageBot apunta a su objetivo fijo; el Aimbot normal al más cercano
+	-- El RageBot apunta a su objetivo fijo (sin filtrar por ignorados); el Aimbot al enemigo más cercano
+	-- a tu mira, filtrando ignorados. Si estás en la pared (o hay una pared en medio),
+	-- getAimbotTarget() devuelve nil → no apunta a ningún lado.
 	local target
 	if state.RageBot then
 		target = rageTarget
 	else
-		target = getNearestPlayer()
+		target = getAimbotTarget()
 	end
-	if not target then aimTargetHead = nil return end
 
-	local _, _, _, tHead = getChar(target)
-	if not tHead then aimTargetHead = nil return end
+	local tHead
+	if target then
+		local _, _, _, h = getChar(target)
+		tHead = h
+	end
+
+	-- Sin objetivo: soltar el control y devolver el giro normal
+	if not tHead then
+		aimTargetHead = nil
+		if autoRotateBackup ~= nil then
+			myHum.AutoRotate = autoRotateBackup
+			autoRotateBackup = nil
+		end
+		return
+	end
+
+	-- Evita errores cuando la cabeza está exactamente encima de la cámara
+	if (tHead.Position - camera.CFrame.Position).Magnitude < 0.1 then
+		aimTargetHead = nil
+		return
+	end
 
 	if autoRotateBackup == nil then
 		autoRotateBackup = myHum.AutoRotate
 	end
 	myHum.AutoRotate = false
 
-	-- La cámara apunta solo a la cabeza
+	-- La cámara apunta DIRECTO a la CABEZA (de lejos y de cerca)
 	camera.CFrame = CFrame.lookAt(camera.CFrame.Position, tHead.Position)
 
 	-- El cuerpo gira hacia el objetivo (horizontal)
 	local flat = Vector3.new(tHead.Position.X, myRoot.Position.Y, tHead.Position.Z)
-	myRoot.CFrame = CFrame.lookAt(myRoot.Position, flat)
+	if (flat - myRoot.Position).Magnitude > 0.05 then
+		myRoot.CFrame = CFrame.lookAt(myRoot.Position, flat)
+	end
 
 	aimTargetHead = tHead
+end)
+
+-- ===== AIM: LA CÁMARA SE DESLIZA RÁPIDO A LA CABEZA DENTRO DEL CÍRCULO ROJO =====
+-- • Solo actúa si el botón AIM está encendido y hay un enemigo DENTRO del círculo (y se ve)
+-- • Va a la CABEZA o al CUERPO según el botón elegido, con un barrido rápido y visible (AIM_SLIDE_TIME)
+-- • Si el AIMBOT (Q + click derecho) o el RageBot están actuando, esos mandan y el deslizamiento espera
+-- • getAimTarget() ya ignora a los jugadores marcados como ignorados en la lista del panel
+local slideProgress = 0 -- 0 = recién detectado, 1 = ya está sobre la cabeza
+
+RunService:BindToRenderStep("GUIXFREE_AimSlide", SLIDE_PRIORITY, function(dt)
+	if not state.AIM or aimbotWants()
+		or (AIM_SLIDE_REQUIRES_CLICK
+			and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)) then
+		slideProgress = 0
+		return
+	end
+
+	local _, _, headPart, bodyPart = getAimTarget()
+	local part = (aimPart == "Head") and headPart or bodyPart
+	if not part then
+		slideProgress = 0 -- nadie dentro del círculo: no hace nada y reinicia
+		return
+	end
+
+	local cf = camera.CFrame
+	if (part.Position - cf.Position).Magnitude < 0.1 then return end
+
+	-- El progreso sube de 0 a 1 en AIM_SLIDE_TIME segundos (independiente de los FPS).
+	-- La cámara base la reescribe el juego cada frame, por eso el avance se guarda aquí
+	-- y no en la cámara: así el barrido se ve completo y rápido, no un empujoncito.
+	slideProgress = math.min(1, slideProgress + dt / math.max(AIM_SLIDE_TIME, 0.01))
+	local eased = 1 - (1 - slideProgress) ^ 3 -- arranca fuerte y frena al llegar
+
+	local goal = CFrame.lookAt(cf.Position, part.Position)
+	camera.CFrame = cf:Lerp(goal, eased)
 end)
 
 -- ===== BRAZOS / MANOS APUNTAN A LA CABEZA =====
@@ -817,7 +1667,7 @@ local function restoreArms()
 end
 
 RunService:BindToRenderStep("GUIXFREE_AimArms", ARMS_PRIORITY, function()
-	local active = state.Aimbot or state.RageBot
+	local active = aimbotWants()
 	if not ARMS_AIM or not active or not aimTargetHead then
 		if next(armState) ~= nil then restoreArms() end
 		return
@@ -901,6 +1751,13 @@ connect(RunService.Heartbeat, function()
 		return
 	end
 
+	-- ¿Lo acabas de marcar como IGNORADO en la lista? → soltar clicks, volver y buscar otro objetivo
+	if rageTarget and ignored[rageTarget] then
+		print("[GUI X FREE][RageBot] " .. rageTarget.Name .. " está ignorado → cambio de objetivo")
+		rageStop(true)
+		return
+	end
+
 	-- Elegir objetivo nuevo y recordar de dónde sales
 	if not rageTarget then
 		rageTarget = getNearestPlayer()
@@ -956,11 +1813,15 @@ connect(RunService.Heartbeat, function()
 end)
 
 -- ===== TRIGGER BOT =====
--- • Detecta si apuntas a un jugador (ignora tu cámara, manos y arma)
--- • Saca el arma con balas (arma 1 → arma 2) y dispara
+-- • En cuanto tu mira toca a un jugador vivo (cabeza, cuerpo, brazos... y sin paredes en medio)
+--   dispara DIRECTO con Tool:Activate()
+-- • Saca el arma con balas (arma 1 → arma 2) si no la tienes en la mano
+-- • Cuando la mira se aparta del enemigo (o muere) suelta el disparo con Tool:Deactivate()
 -- • Si falla, dice por qué en el Output
 local lastSwitch = 0
 local lastDbgMsg, lastDbgTime = "", 0
+local triggerFiring = false
+local triggerTool = nil
 
 local function dbg(msg)
 	if not TRIGGER_DEBUG then return end
@@ -968,6 +1829,17 @@ local function dbg(msg)
 		lastDbgMsg = msg
 		lastDbgTime = os.clock()
 		print("[GUI X FREE][TriggerBot] " .. msg)
+	end
+end
+
+-- Suelta el disparo (para que el arma no siga disparando sola cuando ya no hay enemigo)
+triggerStop = function()
+	if triggerFiring then
+		triggerFiring = false
+		if triggerTool then
+			pcall(function() triggerTool:Deactivate() end)
+		end
+		triggerTool = nil
 	end
 end
 
@@ -999,9 +1871,16 @@ local function getAimedPlayer(myChar)
 end
 
 connect(RunService.Heartbeat, function()
-	if not state.TriggerBot then return end
+	if not state.TriggerBot then
+		triggerStop()
+		return
+	end
+	-- Mientras el RageBot controla los clicks, el TriggerBot no se mete
+	if state.RageBot then return end
+
 	local myChar, myHum = getChar(player)
 	if not myChar then
+		triggerStop()
 		dbg("tu personaje no está vivo")
 		return
 	end
@@ -1015,24 +1894,27 @@ connect(RunService.Heartbeat, function()
 			local nextTool = pickWeapon(myChar)
 			if nextTool and nextTool ~= equipped then
 				lastSwitch = os.clock()
+				triggerStop()
 				dbg("sin balas en '" .. equipped.Name .. "', cambio a '" .. nextTool.Name .. "'")
 				myHum:EquipTool(nextTool)
 			end
 		end
 	end
 
-	-- 2) ¿Estoy apuntando a un jugador vivo?
+	-- 2) ¿Estoy apuntando a un jugador vivo? Si no, suelto el disparo
 	local target, why = getAimedPlayer(myChar)
 	if not target then
+		triggerStop()
 		dbg("sin objetivo: " .. tostring(why))
 		return
 	end
 	if not getChar(target) then
+		triggerStop()
 		dbg(target.Name .. " ya está muerto")
 		return
 	end
 
-	-- 3) Sacar el arma correcta y disparar
+	-- 3) Sacar el arma correcta y disparar DIRECTO
 	local tool = pickWeapon(myChar)
 	if not tool then
 		dbg("no encontré ninguna Tool en tu Backpack ni en la mano (¿tu arma es una Tool?)")
@@ -1048,7 +1930,14 @@ connect(RunService.Heartbeat, function()
 		return
 	end
 
+	-- Si cambió de arma, soltar la anterior
+	if triggerTool and triggerTool ~= tool then
+		pcall(function() triggerTool:Deactivate() end)
+	end
+
 	dbg("disparando a " .. target.Name .. " con '" .. tool.Name .. "'")
+	triggerFiring = true
+	triggerTool = tool
 	tool:Activate()
 end)
 
@@ -1148,6 +2037,84 @@ connect(RunService.RenderStepped, function()
 	end
 end)
 
+-- ===== NOCLIP: TRASPASAR PAREDES =====
+-- Apaga CanCollide de las partes de tu personaje mientras esté encendido y lo devuelve al apagarlo.
+-- (Tu personaje sigue pisando el suelo con normalidad; solo atraviesa paredes y objetos.)
+local noclipChanged = {}
+
+restoreNoclip = function()
+	for part in pairs(noclipChanged) do
+		if part.Parent then part.CanCollide = true end
+		noclipChanged[part] = nil
+	end
+end
+
+connect(RunService.Stepped, function()
+	if not state.Noclip then return end
+	local ch = player.Character
+	if not ch then return end
+	for _, part in ipairs(ch:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			noclipChanged[part] = true
+			part.CanCollide = false
+		end
+	end
+end)
+
+-- ===== FLY: VOLAR =====
+-- W/A/S/D = hacia donde mira la cámara | ESPACIO = subir | CTRL IZQUIERDO = bajar
+local flyBV, flyBG = nil, nil
+
+stopFly = function()
+	if flyBV then flyBV:Destroy() flyBV = nil end
+	if flyBG then flyBG:Destroy() flyBG = nil end
+	local _, hum = getChar(player)
+	if hum then hum.PlatformStand = false end
+end
+
+connect(RunService.RenderStepped, function()
+	if not state.Fly then
+		if flyBV or flyBG then stopFly() end
+		return
+	end
+
+	local myChar, hum, root = getChar(player)
+	if not myChar then return end
+
+	-- (re)crear las fuerzas si no existen o si reapareciste
+	if not flyBV or flyBV.Parent ~= root then
+		if flyBV then flyBV:Destroy() end
+		if flyBG then flyBG:Destroy() end
+
+		flyBV = Instance.new("BodyVelocity")
+		flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+		flyBV.Velocity = Vector3.zero
+		flyBV.Parent = root
+
+		flyBG = Instance.new("BodyGyro")
+		flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+		flyBG.P = 1e4
+		flyBG.CFrame = root.CFrame
+		flyBG.Parent = root
+	end
+
+	hum.PlatformStand = true -- para que el personaje no intente caminar mientras vuelas
+
+	local dir = Vector3.zero
+	if not UserInputService:GetFocusedTextBox() then -- no vuela si estás escribiendo en el chat
+		local cf = camera.CFrame
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cf.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cf.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cf.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cf.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+	end
+
+	flyBV.Velocity = (dir.Magnitude > 0) and (dir.Unit * FLY_SPEED) or Vector3.zero
+	flyBG.CFrame = CFrame.lookAt(root.Position, root.Position + camera.CFrame.LookVector)
+end)
+
 -- ===== CERRAR (apaga todo, restaura y destruye el panel) =====
 connect(closeBtn.MouseButton1Click, function()
 	local fpsWasOn = state.FPSBoost
@@ -1159,6 +2126,16 @@ connect(closeBtn.MouseButton1Click, function()
 	holdFire(false)
 	holdAim(false)
 
+	-- Soltar el disparo del TriggerBot
+	triggerStop()
+
+	-- Apagar el vuelo y devolver la colisión
+	stopFly()
+	restoreNoclip()
+
+	-- Decirle al servidor que ya no hay objetivo en el círculo
+	updateAimHint(nil)
+
 	if fpsWasOn then setFPSBoost(false) end
 
 	restoreArms()
@@ -1169,9 +2146,73 @@ connect(closeBtn.MouseButton1Click, function()
 	end
 
 	RunService:UnbindFromRenderStep("GUIXFREE_Aimbot")
+	RunService:UnbindFromRenderStep("GUIXFREE_AimSlide")
 	RunService:UnbindFromRenderStep("GUIXFREE_AimArms")
 	RunService:UnbindFromRenderStep("GUIXFREE_RageStick")
 	for _, c in ipairs(connections) do c:Disconnect() end
 	table.clear(connections)
 	gui:Destroy()
 end)
+
+-- =====================================================================
+-- ===== DISPARO DE LOS TOOLS (en segundo plano: NUNCA bloquea el panel) =====
+-- =====================================================================
+task.spawn(function()
+	local mouse = player:GetMouse()
+	local shootRemote = ReplicatedStorage:WaitForChild(SHOOT_REMOTE_NAME, 15)
+	if not shootRemote then
+		warn("[GUI X FREE] no encontré '" .. SHOOT_REMOTE_NAME .. "' (el panel funciona igual). "
+			.. "Pega este mismo código también como Script en ServerScriptService para que disparen los Tools.")
+		return
+	end
+
+	local hooked = setmetatable({}, { __mode = "k" })
+
+	local function isGun(tool)
+		if #GUN_TOOL_NAMES == 0 then return true end
+		for _, n in ipairs(GUN_TOOL_NAMES) do
+			if tool.Name == n then return true end
+		end
+		return false
+	end
+
+	local function hookTool(tool)
+		if hooked[tool] or not tool:IsA("Tool") or not isGun(tool) then return end
+		hooked[tool] = true
+
+		local holding, equipped = false, false
+
+		tool.Equipped:Connect(function() equipped = true end)
+		tool.Unequipped:Connect(function()
+			equipped = false
+			holding = false
+		end)
+		tool.Activated:Connect(function()
+			if holding then return end
+			holding = true
+			while holding and equipped do
+				shootRemote:FireServer((mouse.Hit.Position - camera.CFrame.Position).Unit)
+				task.wait(GUN_FIRE_INTERVAL)
+			end
+		end)
+		tool.Deactivated:Connect(function() holding = false end)
+	end
+
+	local function watch(container)
+		for _, c in ipairs(container:GetChildren()) do hookTool(c) end
+		container.ChildAdded:Connect(hookTool)
+	end
+
+	local function onCharacter(char)
+		watch(char)
+		local bp = player:FindFirstChildOfClass("Backpack") or player:WaitForChild("Backpack", 10)
+		if bp then watch(bp) end
+	end
+
+	if player.Character then task.spawn(onCharacter, player.Character) end
+	player.CharacterAdded:Connect(onCharacter)
+	local bp0 = player:FindFirstChildOfClass("Backpack")
+	if bp0 then watch(bp0) end
+end)
+
+print("[GUI X FREE] panel listo")
