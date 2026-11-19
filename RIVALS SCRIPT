@@ -379,12 +379,42 @@ end
 
 -- Enemigo más cercano al centro del círculo (dentro del círculo). Ignora a los jugadores marcados
 -- como ignorados en la lista del panel. Devuelve: player, character, head, body
+-- Enemigo en el que el AIM se queda "fijado": una vez que detecta a alguien dentro
+-- del círculo, ignora a cualquier otro que entre después. Solo se suelta cuando ese
+-- enemigo desaparece (muere / se va) o queda tapado por una pared.
+local aimLockedPlayer = nil
+
 local function getAimTarget()
 	local myChar = getChar(player)
-	if not myChar then return end
+	if not myChar then
+		aimLockedPlayer = nil
+		return
+	end
 
 	local center = aimCenter()
 	local radius = aimDiameter / 2
+
+	-- ¿Ya hay un enemigo fijado? Nos quedamos en él pase lo que pase con los demás.
+	if aimLockedPlayer then
+		if ignored[aimLockedPlayer] then
+			aimLockedPlayer = nil -- lo acaban de marcar como ignorado: se suelta
+		else
+			local c, _, root, head = getChar(aimLockedPlayer)
+			if not c then
+				aimLockedPlayer = nil -- murió o se fue del servidor: se suelta
+			else
+				local body = bodyPartOf(c, root)
+				local visible = not AIM_WALLCHECK or isVisible(head, c, myChar) or isVisible(body, c, myChar)
+				if not visible then
+					aimLockedPlayer = nil -- quedó tapado por una pared: se suelta
+				else
+					return aimLockedPlayer, c, head, body
+				end
+			end
+		end
+	end
+
+	-- Sin nadie fijado todavía: buscar al enemigo más cercano al centro del círculo
 	local bestP, bestC, bestHead, bestBody, bestDist
 
 	for _, p in ipairs(Players:GetPlayers()) do
@@ -410,6 +440,7 @@ local function getAimTarget()
 		end
 	end
 
+	aimLockedPlayer = bestP -- queda fijado desde ahora (nil si no encontró a nadie)
 	return bestP, bestC, bestHead, bestBody
 end
 
@@ -1402,6 +1433,7 @@ connect(RunService.RenderStepped, function()
 	aimCircle.Visible = state.AIM
 	if not state.AIM then
 		updateAimHint(nil)
+		aimLockedPlayer = nil
 		return
 	end
 
