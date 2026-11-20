@@ -9,11 +9,19 @@
 
     RightShift = mostrar/ocultar | Q = activar/desactivar AIMBOT | "–" = minimizar | "✕" = cerrar y apagar todo
 
+    PANEL: es CUADRADO y cada cosa tiene su propio apartado (pestaña), arriba del todo:
+      COMBATE (Aimbot, RageBot, TriggerBot) | AIM (círculo + tamaño + Cabeza/Cuerpo)
+      VISUAL (ESP, FPS Boost) | MOVER (Noclip, Fly) | JUGADORES (lista + ignorar)
+    Toca una pestaña para cambiar de apartado; lo demás sigue funcionando igual detrás.
+
     OPCIONES DEL PANEL:
     • AIMBOT      -> (tecla Q lo deja encendido/apagado) SIN apuntar: en cuanto ve a un enemigo (sin paredes
                      en medio) la cámara va DIRECTO a su CABEZA, de lejos y de cerca (solo cabeza, nunca el
                      cuerpo). Si estás pegado/dentro de una pared o hay una pared en medio, NO apunta a ningún
                      lado. Si prefieres que solo actúe con click derecho: AIMBOT_REQUIRE_RIGHT_CLICK = true.
+                     Trae una barrita "PROBABILIDAD DE FALLAR" (0% a 100%) en el apartado COMBATE: en 0%
+                     nunca falla (siempre pega en la cabeza); más alto, a veces se desvía unos studs a
+                     propósito, para que no parezca tan perfecto.
     • RAGEBOT     -> TP a la espalda del más cercano, mantiene click izquierdo (disparar)
                      y click derecho (apuntar) hasta que muere; luego vuelve a tu posición
     • TRIGGER BOT -> en cuanto tu mira toca a un enemigo dispara DIRECTO (saca el arma con balas si hace falta);
@@ -23,7 +31,12 @@
     • AIM         -> círculo ROJO ajustable. Si hay un enemigo DENTRO del círculo (y se ve, sin paredes),
                      tu cámara hace un barrido RÁPIDO y visible hasta su CABEZA o su CUERPO (lo eliges con
                      los botones CABEZA / CUERPO debajo del deslizador). El servidor redirige a esa misma
-                     parte las balas que iban a fallar. Tú controlas el tiempo con AIM_SLIDE_TIME.
+                     parte las balas que iban a fallar. Tú controlas el tiempo con AIM_SLIDE_TIME. El
+                     deslizador va de 30 a 600 px. Una vez que detecta a un enemigo se queda fijo en él
+                     (ignora a cualquier otro que entre al círculo) hasta que desaparece o lo tapa una pared.
+                     También tiene su propia barrita "PROBABILIDAD DE FALLAR" (0% a 100%) en el apartado
+                     AIM, igual que el Aimbot: en 0% nunca falla; más alto, a veces se desvía a propósito
+                     (y en ese caso no le avisa al servidor, para que el disparo realmente se vaya desviado).
     • NOCLIP      -> traspasas paredes y objetos (al apagarlo vuelve la colisión normal).
     • FLY         -> vuelas: W/A/S/D se mueven hacia donde mira la cámara, ESPACIO sube, CTRL IZQ baja.
     • LISTA DE JUGADORES -> abajo del todo se ve cuántas personas hay en el servidor, con un botón
@@ -246,7 +259,7 @@ local RAGE_AIM_ATTRIBUTE = "GUIXFREE_Aim"   -- atributo del jugador: true = clic
 local RAGE_USE_VIM = true                   -- intenta apretar los clicks reales (puede estar bloqueado)
 
 -- AIM (círculo rojo + deslizamiento a la cabeza)
-local AIM_CIRCLE_MIN = 60                   -- diámetro mínimo del círculo (px)
+local AIM_CIRCLE_MIN = 30                   -- diámetro mínimo del círculo (px)
 local AIM_CIRCLE_MAX = 600                  -- diámetro máximo del círculo (px)
 local AIM_CIRCLE_START = 220                -- diámetro inicial (px)
 local AIM_SLIDE_TIME = 0.12                  -- segundos que tarda en deslizarse hasta la cabeza (0.05 = casi instantáneo, 0.12 = rápido y se nota, 0.3 = lento)
@@ -257,6 +270,9 @@ local AIM_COLOR = Color3.fromRGB(255, 40, 40)     -- círculo rojo normal
 local AIM_COLOR_LOCK = Color3.fromRGB(255, 0, 0)  -- rojo fuerte cuando hay un enemigo dentro
 local AIM_HINT_INTERVAL = 0.1               -- cada cuántos segundos avisa al servidor (y sortea cabeza/cuerpo)
 local AIM_DEBUG = true                      -- avisa en el Output si falta el RemoteEvent del servidor
+-- Probabilidad (0 a 100%) de que el disparo del AIM "falle" a propósito en vez de ir siempre
+-- directo a la cabeza/cuerpo. Se controla con la barrita del panel; en 0% nunca falla.
+local AIM_MISS_CHANCE_DEFAULT = 0
 
 -- Aimbot (tecla Q + click derecho) -> SOLO CABEZA
 local AIMBOT_REQUIRE_RIGHT_CLICK = false -- false = apunta a la cabeza EN CUANTO VE al enemigo (sin apuntar); true = solo con click derecho
@@ -264,6 +280,10 @@ local AIMBOT_WALLCHECK = true            -- true = no apunta si hay una pared en
 local AIMBOT_BLOCK_IN_WALL = true        -- true = si estás pegado/dentro de una pared NO apunta a ningún lado
 local AIMBOT_WALL_RADIUS = 1.2           -- studs alrededor de tu cabeza que cuentan como "estoy en la pared"
 -- (el aimbot NO tiene límite de distancia: apunta a la cabeza de lejos y de cerca)
+-- Misma idea que arriba pero para el AIMBOT: probabilidad (0 a 100%) de fallar a propósito.
+local AIMBOT_MISS_CHANCE_DEFAULT = 0
+local MISS_OFFSET_MIN = 1.2 -- studs mínimos que se desvía cuando "falla"
+local MISS_OFFSET_MAX = 3.2 -- studs máximos que se desvía cuando "falla"
 
 -- Brazos / manos (solo Aimbot / RageBot)
 local ARMS_AIM = true        -- true = el aimbot también mueve brazos/manos hacia la cabeza
@@ -350,6 +370,20 @@ local function tween(obj, props, t)
 	TweenService:Create(obj, TweenInfo.new(t or 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
 end
 
+-- Probabilidad de "fallar a propósito" del AIMBOT y del AIM (0 a 100%, 0 = nunca falla).
+-- Se cambian con la barrita de cada apartado en el panel.
+local aimbotMissChance = AIMBOT_MISS_CHANCE_DEFAULT
+local aimMissChance = AIM_MISS_CHANCE_DEFAULT
+
+-- Vector aleatorio para desviar la mira cuando toca "fallar": siempre se aparta de la
+-- cabeza/cuerpo real entre MISS_OFFSET_MIN y MISS_OFFSET_MAX studs, en una dirección random.
+local function randomMissOffset()
+	local v = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5)
+	if v.Magnitude < 0.01 then v = Vector3.new(1, 0, 0) end
+	local dist = MISS_OFFSET_MIN + math.random() * (MISS_OFFSET_MAX - MISS_OFFSET_MIN)
+	return v.Unit * dist
+end
+
 -- ===== AIM: CÍRCULO + AVISO AL SERVIDOR =====
 local aimDiameter = AIM_CIRCLE_START
 local aimPart = AIM_TARGET_PART -- "Head" o "Body" (lo cambian los botones CABEZA / CUERPO)
@@ -383,6 +417,19 @@ end
 -- del círculo, ignora a cualquier otro que entre después. Solo se suelta cuando ese
 -- enemigo desaparece (muere / se va) o queda tapado por una pared.
 local aimLockedPlayer = nil
+local aimMissRolledFor = nil -- para qué jugador ya se tiró la moneda de "falla o no falla"
+local aimWillMiss = false
+local aimMissOffset = Vector3.zero
+
+-- Tira la moneda UNA sola vez por cada enemigo nuevo que se fija (no en cada frame),
+-- para que el "fallo" se vea como una desviación constante y no como un tembleque.
+local function rollAimMiss(p)
+	if aimMissRolledFor ~= p then
+		aimMissRolledFor = p
+		aimWillMiss = (p ~= nil) and (math.random(100) <= aimMissChance)
+		aimMissOffset = aimWillMiss and randomMissOffset() or Vector3.zero
+	end
+end
 
 local function getAimTarget()
 	local myChar = getChar(player)
@@ -408,6 +455,7 @@ local function getAimTarget()
 				if not visible then
 					aimLockedPlayer = nil -- quedó tapado por una pared: se suelta
 				else
+					rollAimMiss(aimLockedPlayer)
 					return aimLockedPlayer, c, head, body
 				end
 			end
@@ -441,6 +489,7 @@ local function getAimTarget()
 	end
 
 	aimLockedPlayer = bestP -- queda fijado desde ahora (nil si no encontró a nadie)
+	rollAimMiss(aimLockedPlayer)
 	return bestP, bestC, bestHead, bestBody
 end
 
@@ -555,10 +604,12 @@ local function sendHint(targetName, partName)
 end
 
 local function updateAimHint(target)
-	if not target then
+	-- Si tocó "fallar" en esta fijación, no avisamos al servidor: así el disparo
+	-- realmente se va a donde apunta la cámara (desviada) en vez de corregirse solo.
+	if not target or aimWillMiss then
 		if hintActive then
 			hintActive = false
-			sendHint(nil, nil) -- nadie dentro: el servidor deja de hacer nada
+			sendHint(nil, nil) -- nadie dentro (o toca fallar): el servidor deja de hacer nada
 		end
 		return
 	end
@@ -899,13 +950,17 @@ gui.IgnoreGuiInset = true
 gui.DisplayOrder = 999
 gui.Parent = player:WaitForChild("PlayerGui")
 
+local FRAME_SIZE = 440 -- panel cuadrado: ancho y alto iguales
 local HEADER_H = 46
-local BODY_H = 780
-local FULL_H = HEADER_H + BODY_H
+local TAB_H = 38
+local FOOTER_H = 18
+local BODY_H = FRAME_SIZE - HEADER_H
+local CONTENT_H = BODY_H - TAB_H - FOOTER_H
+local FULL_H = FRAME_SIZE
 
 local frame = Instance.new("Frame")
 frame.Name = "Main"
-frame.Size = UDim2.fromOffset(270, FULL_H)
+frame.Size = UDim2.fromOffset(FRAME_SIZE, FULL_H)
 frame.Position = UDim2.new(0, 30, 0.5, -FULL_H / 2)
 frame.BackgroundColor3 = THEME.bg
 frame.BorderSizePixel = 0
@@ -1002,34 +1057,119 @@ do
 	end)
 end
 
--- Cuerpo
+-- Cuerpo: barra de pestañas arriba + un apartado (página) distinto para cada cosa
 local body = Instance.new("Frame")
 body.Size = UDim2.new(1, 0, 0, BODY_H)
 body.Position = UDim2.fromOffset(0, HEADER_H)
 body.BackgroundTransparency = 1
 body.Parent = frame
 
-local bodyPad = Instance.new("UIPadding")
-bodyPad.PaddingTop = UDim.new(0, 12)
-bodyPad.PaddingLeft = UDim.new(0, 12)
-bodyPad.PaddingRight = UDim.new(0, 12)
-bodyPad.Parent = body
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, 0, 0, TAB_H)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = body
 
-local bodyLayout = Instance.new("UIListLayout")
-bodyLayout.Padding = UDim.new(0, 8)
-bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
-bodyLayout.Parent = body
+local tabBarPad = Instance.new("UIPadding")
+tabBarPad.PaddingLeft = UDim.new(0, 8)
+tabBarPad.PaddingRight = UDim.new(0, 8)
+tabBarPad.PaddingTop = UDim.new(0, 6)
+tabBarPad.Parent = tabBar
+
+local tabBarLayout = Instance.new("UIListLayout")
+tabBarLayout.FillDirection = Enum.FillDirection.Horizontal
+tabBarLayout.Padding = UDim.new(0, 6)
+tabBarLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabBarLayout.Parent = tabBar
+
+local contentArea = Instance.new("Frame")
+contentArea.Size = UDim2.new(1, 0, 0, CONTENT_H)
+contentArea.Position = UDim2.fromOffset(0, TAB_H)
+contentArea.BackgroundTransparency = 1
+contentArea.ClipsDescendants = true
+contentArea.Parent = body
+
+local pages = {}       -- [key] = Frame (el apartado de cada cosa)
+local tabButtons = {}  -- [key] = TextButton
+local TAB_DEFS = {
+	{ key = "combate",   label = "COMBATE" },
+	{ key = "aim",       label = "AIM" },
+	{ key = "visual",    label = "VISUAL" },
+	{ key = "mover",     label = "MOVER" },
+	{ key = "jugadores", label = "JUGADORES" },
+}
+
+local function newPage(key)
+	local page = Instance.new("Frame")
+	page.Name = key
+	page.Size = UDim2.fromScale(1, 1)
+	page.BackgroundTransparency = 1
+	page.Visible = false
+	page.Parent = contentArea
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 10)
+	pad.PaddingLeft = UDim.new(0, 12)
+	pad.PaddingRight = UDim.new(0, 12)
+	pad.Parent = page
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = page
+
+	pages[key] = page
+	return page
+end
+
+local selectedTab = TAB_DEFS[1].key
+
+local function selectTab(key)
+	selectedTab = key
+	for k, page in pairs(pages) do
+		page.Visible = (k == key)
+	end
+	for k, btn in pairs(tabButtons) do
+		tween(btn, { BackgroundColor3 = (k == key) and THEME.accent or Color3.fromRGB(34, 34, 50) }, 0.15)
+	end
+end
+
+for i, def in ipairs(TAB_DEFS) do
+	newPage(def.key)
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0, (FRAME_SIZE - 16 - (#TAB_DEFS - 1) * 6) / #TAB_DEFS, 1, 0)
+	btn.LayoutOrder = i
+	btn.BackgroundColor3 = Color3.fromRGB(34, 34, 50)
+	btn.Text = def.label
+	btn.TextColor3 = THEME.text
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 11
+	btn.AutoButtonColor = false
+	btn.Parent = tabBar
+	corner(btn, 8)
+
+	tabButtons[def.key] = btn
+	connect(btn.MouseButton1Click, function() selectTab(def.key) end)
+end
+
+selectTab(selectedTab)
+
+local combatePage = pages.combate
+local aimPage = pages.aim
+local visualPage = pages.visual
+local moverPage = pages.mover
+local jugadoresPage = pages.jugadores
 
 -- Guarda la función que actualiza cada interruptor (para poder moverlo desde una tecla)
 local toggleRefresh = {}
 
-local function makeToggle(name, label, subtitle, order, onChange)
+local function makeToggle(parent, name, label, subtitle, order, onChange)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 46)
 	row.BackgroundColor3 = THEME.row
 	row.BorderSizePixel = 0
 	row.LayoutOrder = order
-	row.Parent = body
+	row.Parent = parent
 	corner(row, 10)
 
 	local rowStroke = Instance.new("UIStroke")
@@ -1098,18 +1238,134 @@ local function makeToggle(name, label, subtitle, order, onChange)
 	connect(click.MouseLeave, function() tween(row, { BackgroundColor3 = THEME.row }, 0.15) end)
 end
 
-makeToggle("Aimbot", "AIMBOT [Q]", "Lo ve → cabeza directo", 1)
-makeToggle("RageBot", "RAGEBOT", "TP, click izq + der, mata", 2, function(on)
+-- Barrita de 0% a 100% reutilizable (la usamos para "probabilidad de fallar" del
+-- AIMBOT y del AIM, pero sirve para cualquier otro porcentaje que se necesite después).
+local function makePercentSlider(parent, order, titleText, barColor, initial, onChange)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 56)
+	row.BackgroundColor3 = THEME.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = parent
+	corner(row, 10)
+
+	local rowStroke = Instance.new("UIStroke")
+	rowStroke.Color = Color3.fromRGB(45, 45, 65)
+	rowStroke.Thickness = 1
+	rowStroke.Parent = row
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, -90, 0, 20)
+	lbl.Position = UDim2.fromOffset(12, 6)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = titleText
+	lbl.TextColor3 = THEME.text
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextSize = 12
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Parent = row
+
+	local valueLbl = Instance.new("TextLabel")
+	valueLbl.Size = UDim2.fromOffset(70, 20)
+	valueLbl.Position = UDim2.new(1, -82, 0, 6)
+	valueLbl.BackgroundTransparency = 1
+	valueLbl.Text = ""
+	valueLbl.TextColor3 = barColor
+	valueLbl.Font = Enum.Font.GothamBold
+	valueLbl.TextSize = 12
+	valueLbl.TextXAlignment = Enum.TextXAlignment.Right
+	valueLbl.Parent = row
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.new(1, -28, 0, 6)
+	track.Position = UDim2.fromOffset(14, 38)
+	track.BackgroundColor3 = THEME.off
+	track.BorderSizePixel = 0
+	track.Parent = row
+	corner(track, 3)
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.BackgroundColor3 = barColor
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+	corner(fill, 3)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.Position = UDim2.new(0, 0, 0.5, 0)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+	corner(knob, 8)
+
+	local hit = Instance.new("TextButton")
+	hit.Size = UDim2.new(1, -16, 0, 28)
+	hit.Position = UDim2.fromOffset(8, 27)
+	hit.BackgroundTransparency = 1
+	hit.Text = ""
+	hit.Parent = row
+
+	local value = initial
+
+	local function updateVisual()
+		local frac = value / 100
+		fill.Size = UDim2.new(frac, 0, 1, 0)
+		knob.Position = UDim2.new(frac, 0, 0.5, 0)
+		valueLbl.Text = tostring(value) .. "%"
+	end
+
+	local function setValue(v)
+		value = math.clamp(math.floor(v + 0.5), 0, 100)
+		updateVisual()
+		if onChange then onChange(value) end
+	end
+	setValue(initial)
+
+	local dragging = false
+	local function setFromX(x)
+		local frac = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		setValue(frac * 100)
+	end
+
+	connect(hit.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	connect(UserInputService.InputChanged, function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end)
+	connect(UserInputService.InputEnded, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	return { get = function() return value end, set = setValue }
+end
+
+makeToggle(combatePage, "Aimbot", "AIMBOT [Q]", "Lo ve → cabeza directo", 1)
+makeToggle(combatePage, "RageBot", "RAGEBOT", "TP, click izq + der, mata", 2, function(on)
 	-- Al apagarlo: soltar los clicks y volver a tu posición original
 	if not on and rageStop then rageStop(true) end
 end)
-makeToggle("TriggerBot", "TRIGGER BOT", "Dispara directo al verlo", 3, function(on)
+makeToggle(combatePage, "TriggerBot", "TRIGGER BOT", "Dispara directo al verlo", 3, function(on)
 	-- Al apagarlo: soltar el disparo
 	if not on and triggerStop then triggerStop() end
 end)
-makeToggle("ESP", "ESP", "Caja 2D + barra de vida", 4)
-makeToggle("FPSBoost", "FPS BOOST", "Menos efectos, más FPS", 5, setFPSBoost)
-makeToggle("AIM", "AIM", "Círculo → cabeza o cuerpo", 6)
+makePercentSlider(combatePage, 4, "AIMBOT: PROBABILIDAD DE FALLAR", Color3.fromRGB(255, 90, 90), AIMBOT_MISS_CHANCE_DEFAULT, function(v)
+	aimbotMissChance = v
+end)
+
+makeToggle(visualPage, "ESP", "ESP", "Caja 2D + barra de vida", 1)
+makeToggle(visualPage, "FPSBoost", "FPS BOOST", "Menos efectos, más FPS", 2, setFPSBoost)
+
+makeToggle(aimPage, "AIM", "AIM", "Círculo → cabeza o cuerpo", 1)
 
 -- ===== CÍRCULO AIM (ROJO) + DESLIZADOR DE TAMAÑO =====
 local aimCircle = Instance.new("Frame")
@@ -1135,8 +1391,8 @@ local sliderRow = Instance.new("Frame")
 sliderRow.Size = UDim2.new(1, 0, 0, 56)
 sliderRow.BackgroundColor3 = THEME.row
 sliderRow.BorderSizePixel = 0
-sliderRow.LayoutOrder = 7
-sliderRow.Parent = body
+sliderRow.LayoutOrder = 2
+sliderRow.Parent = aimPage
 corner(sliderRow, 10)
 
 local sliderStroke = Instance.new("UIStroke")
@@ -1239,8 +1495,8 @@ local partRow = Instance.new("Frame")
 partRow.Size = UDim2.new(1, 0, 0, 46)
 partRow.BackgroundColor3 = THEME.row
 partRow.BorderSizePixel = 0
-partRow.LayoutOrder = 8
-partRow.Parent = body
+partRow.LayoutOrder = 3
+partRow.Parent = aimPage
 corner(partRow, 10)
 
 local partStroke = Instance.new("UIStroke")
@@ -1295,10 +1551,14 @@ connect(bodyBtn.MouseButton1Click, function()
 	refreshPartButtons()
 end)
 
-makeToggle("Noclip", "NOCLIP", "Traspasar paredes", 9, function(on)
+makePercentSlider(aimPage, 4, "AIM: PROBABILIDAD DE FALLAR", Color3.fromRGB(255, 90, 90), AIM_MISS_CHANCE_DEFAULT, function(v)
+	aimMissChance = v
+end)
+
+makeToggle(moverPage, "Noclip", "NOCLIP", "Traspasar paredes", 1, function(on)
 	if not on and restoreNoclip then restoreNoclip() end
 end)
-makeToggle("Fly", "FLY", "Volar: WASD, Espacio, Ctrl", 10, function(on)
+makeToggle(moverPage, "Fly", "FLY", "Volar: WASD, Espacio, Ctrl", 2, function(on)
 	if not on and stopFly then stopFly() end
 end)
 
@@ -1311,11 +1571,11 @@ playerCountLabel.TextColor3 = THEME.text
 playerCountLabel.Font = Enum.Font.GothamBold
 playerCountLabel.TextSize = 12
 playerCountLabel.TextXAlignment = Enum.TextXAlignment.Left
-playerCountLabel.LayoutOrder = 11
-playerCountLabel.Parent = body
+playerCountLabel.LayoutOrder = 1
+playerCountLabel.Parent = jugadoresPage
 
 local playersList = Instance.new("ScrollingFrame")
-playersList.Size = UDim2.new(1, 0, 0, 150)
+playersList.Size = UDim2.new(1, 0, 1, -28)
 playersList.BackgroundColor3 = THEME.row
 playersList.BorderSizePixel = 0
 playersList.Active = true
@@ -1324,8 +1584,8 @@ playersList.ScrollBarThickness = 5
 playersList.ScrollBarImageColor3 = THEME.accent
 playersList.CanvasSize = UDim2.new(0, 0, 0, 0)
 playersList.AutomaticCanvasSize = Enum.AutomaticSize.Y
-playersList.LayoutOrder = 12
-playersList.Parent = body
+playersList.LayoutOrder = 2
+playersList.Parent = jugadoresPage
 corner(playersList, 10)
 
 local playersListStroke = Instance.new("UIStroke")
@@ -1448,13 +1708,14 @@ connect(RunService.RenderStepped, function()
 end)
 
 local footer = Instance.new("TextLabel")
-footer.Size = UDim2.new(1, 0, 0, 16)
+footer.Size = UDim2.new(1, 0, 0, FOOTER_H)
+footer.Position = UDim2.fromOffset(0, TAB_H + CONTENT_H)
 footer.BackgroundTransparency = 1
 footer.Text = "RightShift: ocultar / mostrar  |  Q: aimbot"
 footer.TextColor3 = THEME.subtext
 footer.Font = Enum.Font.Gotham
 footer.TextSize = 11
-footer.LayoutOrder = 13
+footer.TextXAlignment = Enum.TextXAlignment.Center
 footer.Parent = body
 
 -- Minimizar
@@ -1464,9 +1725,9 @@ connect(minBtn.MouseButton1Click, function()
 	minBtn.Text = minimized and "+" or "–"
 	if minimized then
 		body.Visible = false
-		tween(frame, { Size = UDim2.fromOffset(270, HEADER_H) }, 0.25)
+		tween(frame, { Size = UDim2.fromOffset(FRAME_SIZE, HEADER_H) }, 0.25)
 	else
-		tween(frame, { Size = UDim2.fromOffset(270, FULL_H) }, 0.25)
+		tween(frame, { Size = UDim2.fromOffset(FRAME_SIZE, FULL_H) }, 0.25)
 		task.delay(0.1, function()
 			if not minimized then body.Visible = true end
 		end)
@@ -1525,6 +1786,20 @@ local SLIDE_PRIORITY = Enum.RenderPriority.Camera.Value + 2
 local ARMS_PRIORITY = Enum.RenderPriority.Camera.Value + 3
 local autoRotateBackup = nil
 local aimTargetHead = nil
+
+-- Probabilidad de "fallar a propósito" del AIMBOT (barrita en el apartado COMBATE).
+-- Se tira la moneda una sola vez por cada enemigo nuevo, no en cada frame.
+local aimbotMissRolledFor = nil
+local aimbotWillMiss = false
+local aimbotMissOffsetVec = Vector3.zero
+
+local function rollAimbotMiss(p)
+	if aimbotMissRolledFor ~= p then
+		aimbotMissRolledFor = p
+		aimbotWillMiss = (p ~= nil) and (math.random(100) <= aimbotMissChance)
+		aimbotMissOffsetVec = aimbotWillMiss and randomMissOffset() or Vector3.zero
+	end
+end
 
 -- ¿Estás manteniendo el click derecho (apuntar)?
 local function rightClickHeld()
@@ -1595,8 +1870,18 @@ RunService:BindToRenderStep("GUIXFREE_Aimbot", AIM_PRIORITY, function()
 	end
 	myHum.AutoRotate = false
 
-	-- La cámara apunta DIRECTO a la CABEZA (de lejos y de cerca)
-	camera.CFrame = CFrame.lookAt(camera.CFrame.Position, tHead.Position)
+	-- Si es el AIMBOT (no el RageBot) el que controla, aplica la barrita de "probabilidad
+	-- de fallar": en 0% siempre pega en la cabeza; más alto, a veces se desvía unos studs.
+	local aimPoint = tHead.Position
+	if not state.RageBot then
+		rollAimbotMiss(target)
+		if aimbotWillMiss then
+			aimPoint = tHead.Position + aimbotMissOffsetVec
+		end
+	end
+
+	-- La cámara apunta DIRECTO a la CABEZA (de lejos y de cerca), salvo que haya tocado fallar
+	camera.CFrame = CFrame.lookAt(camera.CFrame.Position, aimPoint)
 
 	-- El cuerpo gira hacia el objetivo (horizontal)
 	local flat = Vector3.new(tHead.Position.X, myRoot.Position.Y, tHead.Position.Z)
@@ -1629,8 +1914,12 @@ RunService:BindToRenderStep("GUIXFREE_AimSlide", SLIDE_PRIORITY, function(dt)
 		return
 	end
 
+	-- Si tocó "fallar" (barrita AIM: PROBABILIDAD DE FALLAR), el barrido se desvía
+	-- unos studs en vez de ir exacto a la cabeza/cuerpo.
+	local aimPoint = part.Position + (aimWillMiss and aimMissOffset or Vector3.zero)
+
 	local cf = camera.CFrame
-	if (part.Position - cf.Position).Magnitude < 0.1 then return end
+	if (aimPoint - cf.Position).Magnitude < 0.1 then return end
 
 	-- El progreso sube de 0 a 1 en AIM_SLIDE_TIME segundos (independiente de los FPS).
 	-- La cámara base la reescribe el juego cada frame, por eso el avance se guarda aquí
@@ -1638,7 +1927,7 @@ RunService:BindToRenderStep("GUIXFREE_AimSlide", SLIDE_PRIORITY, function(dt)
 	slideProgress = math.min(1, slideProgress + dt / math.max(AIM_SLIDE_TIME, 0.01))
 	local eased = 1 - (1 - slideProgress) ^ 3 -- arranca fuerte y frena al llegar
 
-	local goal = CFrame.lookAt(cf.Position, part.Position)
+	local goal = CFrame.lookAt(cf.Position, aimPoint)
 	camera.CFrame = cf:Lerp(goal, eased)
 end)
 
